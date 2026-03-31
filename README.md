@@ -1,36 +1,100 @@
-This is a [Next.js](https://nextjs.org) project bootstrapped with [`create-next-app`](https://nextjs.org/docs/app/api-reference/cli/create-next-app).
+# Battleship: Solo Tactical
 
-## Getting Started
+A modern, single-player Battleship experience focused on fast gameplay, clear feedback loops, and a foundation for AI-driven system evolution.
 
-First, run the development server:
+---
+
+## Overview
+
+This project started as a simple question:
+
+What does a well-scoped, polished game look like when built using AI-assisted development tools?
+
+Rather than overbuilding, I focused on a tight core:
+- small grid
+- simple rules
+- strong visual feedback
+- fast iteration
+
+The result is a replayable game that emphasizes decision-making under constraints.
+
+---
+
+## Gameplay
+
+- 6x6 grid
+- Two hidden ships (length 3 and 2)
+- Limited number of shots per game
+- Immediate feedback on each move (hit or miss)
+- Win and loss conditions
+- Reset to replay
+
+The shot limit introduces tension and forces more deliberate play, moving the experience beyond simple exploration.
+
+---
+
+## Product Approach
+
+The initial version was a deterministic system where the user would eventually win.
+
+To improve engagement, I introduced:
+- constraints (limited shots)
+- clear feedback loops
+- a tighter interaction model
+
+This shifts the experience toward:
+> making informed decisions rather than randomly clicking
+
+The scope was intentionally constrained to ensure a complete, polished experience before adding complexity.
+
+---
+
+## System Evolution
+
+This project is designed to evolve incrementally.
+
+Planned extensions include:
+- pattern-based ship placement (beyond pure randomness)
+- difficulty modes
+- adaptive behavior based on player performance
+- AI-assisted feedback and strategy hints
+
+Longer term, the goal is to explore agent-based systems that influence gameplay and difficulty.
+
+---
+
+## Tech Stack
+
+- Next.js (React)
+- Tailwind CSS
+- Cursor (AI-assisted development)
+- Claude (reasoning and system design support)
+
+---
+
+## Development Approach
+
+This project was built using an AI-assisted workflow:
+
+- Cursor was used to generate and iterate on code
+- Changes were applied incrementally (UI → logic → refinement)
+- Claude was used selectively to reason through logic and structure
+
+The focus was on maintaining control of the system while using AI to accelerate execution.
+
+---
+
+## Next Steps
+
+- Introduce difficulty levels
+- Improve ship placement logic
+- Add lightweight AI-driven feedback
+- Continue refining interaction and visual polish
+
+---
+
+## Running Locally
 
 ```bash
+npm install
 npm run dev
-# or
-yarn dev
-# or
-pnpm dev
-# or
-bun dev
-```
-
-Open [http://localhost:3000](http://localhost:3000) with your browser to see the result.
-
-You can start editing the page by modifying `app/page.tsx`. The page auto-updates as you edit the file.
-
-This project uses [`next/font`](https://nextjs.org/docs/app/building-your-application/optimizing/fonts) to automatically optimize and load [Geist](https://vercel.com/font), a new font family for Vercel.
-
-## Learn More
-
-To learn more about Next.js, take a look at the following resources:
-
-- [Next.js Documentation](https://nextjs.org/docs) - learn about Next.js features and API.
-- [Learn Next.js](https://nextjs.org/learn) - an interactive Next.js tutorial.
-
-You can check out [the Next.js GitHub repository](https://github.com/vercel/next.js) - your feedback and contributions are welcome!
-
-## Deploy on Vercel
-
-The easiest way to deploy your Next.js app is to use the [Vercel Platform](https://vercel.com/new?utm_medium=default-template&filter=next.js&utm_source=create-next-app&utm_campaign=create-next-app-readme) from the creators of Next.js.
-
-Check out our [Next.js deployment documentation](https://nextjs.org/docs/app/building-your-application/deploying) for more details.
