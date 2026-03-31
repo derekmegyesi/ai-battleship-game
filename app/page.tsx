@@ -3,7 +3,6 @@
 
 import {
   useEffect,
-  useId,
   useMemo,
   useRef,
   useState,
@@ -527,103 +526,7 @@ function hullFragmentsForShipCells(
   return map;
 }
 
-/** Metallic hull silhouette inside hit cells; segment matches orientation along the ship. */
-function ShipHitHullGraphic({ fragment }: { fragment: HullFragment }) {
-  const uid = useId().replace(/:/g, "");
-  const gid = `hit-hull-${uid}`;
-
-  let pathD: string;
-  let deckLine: { x1: number; y1: number; x2: number; y2: number } | null =
-    null;
-  let turret: { cx: number; cy: number; r: number } | null = null;
-
-  if (fragment.kind === "h") {
-    if (fragment.segment === "single") {
-      pathD =
-        "M 12 50 L 22 24 L 78 24 L 88 50 L 78 76 L 22 76 Z";
-      deckLine = { x1: 22, y1: 32, x2: 78, y2: 32 };
-      turret = { cx: 50, cy: 50, r: 5 };
-    } else if (fragment.segment === "first") {
-      pathD = "M 2 50 L 12 20 L 100 20 L 100 80 L 12 80 Z";
-      deckLine = { x1: 12, y1: 30, x2: 100, y2: 30 };
-    } else if (fragment.segment === "mid") {
-      pathD = "M 0 20 L 100 20 L 100 80 L 0 80 Z";
-      deckLine = { x1: 0, y1: 30, x2: 100, y2: 30 };
-      turret = { cx: 50, cy: 42, r: 6 };
-    } else {
-      pathD = "M 0 20 L 90 20 L 98 50 L 90 80 L 0 80 Z";
-      deckLine = { x1: 0, y1: 30, x2: 90, y2: 30 };
-    }
-  } else if (fragment.segment === "single") {
-    pathD =
-      "M 50 12 L 76 22 L 76 78 L 50 88 L 24 78 L 24 22 Z";
-    deckLine = { x1: 26, y1: 30, x2: 74, y2: 30 };
-    turret = { cx: 50, cy: 52, r: 5 };
-  } else if (fragment.segment === "first") {
-    pathD = "M 50 2 L 80 12 L 80 100 L 20 100 L 20 12 Z";
-    deckLine = { x1: 22, y1: 18, x2: 78, y2: 18 };
-  } else if (fragment.segment === "mid") {
-    pathD = "M 20 0 L 80 0 L 80 100 L 20 100 Z";
-    deckLine = { x1: 22, y1: 28, x2: 78, y2: 28 };
-    turret = { cx: 50, cy: 48, r: 6 };
-  } else {
-    pathD = "M 20 0 L 80 0 L 80 90 L 50 98 L 20 90 Z";
-    deckLine = { x1: 22, y1: 22, x2: 78, y2: 22 };
-  }
-
-  return (
-    <svg
-      aria-hidden
-      className="pointer-events-none absolute inset-[9%] z-0 overflow-visible"
-      viewBox="0 0 100 100"
-      preserveAspectRatio="none"
-    >
-      <defs>
-        <linearGradient id={gid} x1="0%" y1="0%" x2="0%" y2="100%">
-          <stop offset="0%" stopColor="rgb(148, 163, 184)" stopOpacity="0.55" />
-          <stop offset="35%" stopColor="rgb(71, 85, 105)" stopOpacity="0.85" />
-          <stop offset="100%" stopColor="rgb(30, 41, 59)" stopOpacity="0.95" />
-        </linearGradient>
-        <linearGradient id={`${gid}-rim`} x1="0%" y1="0%" x2="100%" y2="0%">
-          <stop offset="0%" stopColor="rgba(251, 113, 133, 0.45)" />
-          <stop offset="100%" stopColor="rgba(244, 63, 94, 0.25)" />
-        </linearGradient>
-      </defs>
-      <path
-        d={pathD}
-        fill={`url(#${gid})`}
-        stroke={`url(#${gid}-rim)`}
-        strokeWidth={2.5}
-        strokeLinejoin="round"
-        vectorEffect="non-scaling-stroke"
-      />
-      {deckLine && (
-        <line
-          x1={deckLine.x1}
-          y1={deckLine.y1}
-          x2={deckLine.x2}
-          y2={deckLine.y2}
-          stroke="rgba(255,255,255,0.22)"
-          strokeWidth={1.2}
-          vectorEffect="non-scaling-stroke"
-        />
-      )}
-      {turret && (
-        <circle
-          cx={turret.cx}
-          cy={turret.cy}
-          r={turret.r}
-          fill="rgb(51, 65, 85)"
-          stroke="rgba(255,255,255,0.2)"
-          strokeWidth={1}
-          vectorEffect="non-scaling-stroke"
-        />
-      )}
-    </svg>
-  );
-}
-
-/** Subtle per-cell hull strokes when that ship is fully hit (sunk); reads as one outline across the grid. */
+/** White hull strokes only when a ship is fully sunk — avoids revealing orientation on partial hits. */
 function ShipOutlineWatermark({ fragment }: { fragment: HullFragment }) {
   const stroke =
     "pointer-events-none absolute z-[1] border-white/[0.2] shadow-none";
@@ -808,17 +711,6 @@ export default function Home() {
     for (const ship of game.ships) {
       if (!ship.every((c) => game.hits.has(c))) continue;
       hullFragmentsForShipCells(ship).forEach((frag, cell) => map.set(cell, frag));
-    }
-    return map;
-  }, [game]);
-
-  const hitHullFragmentByCell = useMemo(() => {
-    const map = new Map<number, HullFragment>();
-    if (!game) return map;
-    for (const ship of game.ships) {
-      hullFragmentsForShipCells(ship).forEach((frag, cell) => {
-        if (game.hits.has(cell)) map.set(cell, frag);
-      });
     }
     return map;
   }, [game]);
@@ -1391,8 +1283,6 @@ export default function Home() {
                 const isExploding = explodingCells.has(i);
                 const shipIdx = shipIndexByCell.get(i) ?? null;
                 const sunkHullFragment = sunkHullFragmentByCell.get(i);
-                const hitHullFragment =
-                  isHit && isShip ? hitHullFragmentByCell.get(i) ?? null : null;
 
                 const cellBase =
                   "group relative aspect-square rounded-lg border transform-gpu focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-teal-400/70 focus-visible:ring-offset-2 focus-visible:ring-offset-[#0c1526] transition-[background-color,border-color,box-shadow,transform,opacity,filter] duration-300 ease-out active:scale-[0.96]";
@@ -1485,9 +1375,6 @@ export default function Home() {
                       winAnim,
                     ].join(" ")}
                   >
-                    {hitHullFragment && (
-                      <ShipHitHullGraphic fragment={hitHullFragment} />
-                    )}
                     {sunkHullFragment && (
                       <ShipOutlineWatermark fragment={sunkHullFragment} />
                     )}

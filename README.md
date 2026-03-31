@@ -1,4 +1,7 @@
 # Battleship: Solo Tactical
+<p align="center">
+  <img src="./gameplay.gif" alt="Battleship gameplay demo" width="600"/>
+</p>
 
 A modern, single-player Battleship experience focused on fast gameplay, clear feedback loops, and a foundation for AI-driven system evolution.
 
