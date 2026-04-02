@@ -8,11 +8,10 @@ import {
   useState,
   useSyncExternalStore,
 } from "react";
+import { flushSync } from "react-dom";
 
 const BOARD_SIZE = 6;
 const TOTAL_CELLS = BOARD_SIZE * BOARD_SIZE;
-/** Maximum number of cells the player may fire at before losing (if ships remain). */
-const SHOT_LIMIT = 12;
 /** After this many consecutive misses without a hit, show a subtle tip until the next hit. */
 const CONSECUTIVE_MISS_HINT_AFTER = 3;
 /** How long we keep the explosion icon visible before revealing the hit mark. */
@@ -21,6 +20,155 @@ const EXPLOSION_MS = 300;
 const RESET_FADE_OUT_MS = 360;
 const RESET_CONFIRM_MESSAGE =
   "Start a new game? Your current board and shots will be cleared.";
+
+/** Silence after any `public/audio` clip ends (ms). */
+const PUBLIC_AUDIO_POST_GAP_MS = 500;
+
+const PLAYERS_TURN_AUDIO_SRC = "/audio/players_turn.mp3";
+const OPPONENTS_TURN_AUDIO_SRC = "/audio/opponents_turn.mp3";
+const SUNK_BATTLESHIP_AUDIO_SRC = "/audio/sunk_battleship.mp3";
+const SUNK_FLEET_AUDIO_SRC = "/audio/sunk_fleet.mp3";
+const HIT_AUDIO_SRC = "/audio/hit.mp3";
+const MISS_AUDIO_SRC = "/audio/miss.mp3";
+
+/**
+ * Plays a file from `public/audio`, then waits {@link PUBLIC_AUDIO_POST_GAP_MS}
+ * after the clip ends (or if play fails). Returns cleanup (pause + clear timers).
+ */
+function runAfterPublicAudioClip(
+  src: string,
+  onAfterGap: () => void,
+): () => void {
+  if (typeof window === "undefined") {
+    return () => {};
+  }
+  const audio = new Audio(src);
+  let cancelled = false;
+  /** Browser timer id (avoids NodeJS.Timeout vs number under @types/node). */
+  let gapTimer: number | null = null;
+  let clipComplete = false;
+
+  const scheduleGap = () => {
+    if (cancelled || clipComplete) return;
+    clipComplete = true;
+    gapTimer = window.setTimeout(() => {
+      gapTimer = null;
+      if (cancelled) return;
+      onAfterGap();
+    }, PUBLIC_AUDIO_POST_GAP_MS);
+  };
+
+  const onEnded = () => {
+    scheduleGap();
+  };
+  const onError = () => {
+    scheduleGap();
+  };
+
+  audio.addEventListener("ended", onEnded, { once: true });
+  audio.addEventListener("error", onError, { once: true });
+
+  void audio.play().catch(() => {
+    scheduleGap();
+  });
+
+  return () => {
+    cancelled = true;
+    audio.pause();
+    audio.removeEventListener("ended", onEnded);
+    audio.removeEventListener("error", onError);
+    if (gapTimer !== null) {
+      window.clearTimeout(gapTimer);
+    }
+  };
+}
+
+const TURN_CALLOUT_AUDIO_TAG = "turn-callout";
+
+type PublicAudioQueueJob = {
+  src: string;
+  afterGap: () => void;
+  tag?: string;
+};
+
+const publicAudioQueue: PublicAudioQueueJob[] = [];
+let publicAudioBusy = false;
+let publicAudioCurrentCleanup: (() => void) | null = null;
+let publicAudioCurrentTag: string | undefined;
+
+function drainPublicAudioQueue(): void {
+  if (typeof window === "undefined" || publicAudioBusy) return;
+  if (publicAudioQueue.length === 0) return;
+  const job = publicAudioQueue.shift()!;
+  publicAudioBusy = true;
+  publicAudioCurrentTag = job.tag;
+  publicAudioCurrentCleanup = runAfterPublicAudioClip(job.src, () => {
+    job.afterGap();
+    publicAudioCurrentCleanup = null;
+    publicAudioCurrentTag = undefined;
+    publicAudioBusy = false;
+    drainPublicAudioQueue();
+  });
+}
+
+/**
+ * Enqueue one “sound + post-gap” event. The next event does not start until this
+ * one fully finishes (like waiting on a child process).
+ */
+function enqueuePublicAudioEvent(
+  src: string,
+  afterGap: () => void,
+  tag?: string,
+): void {
+  if (typeof window === "undefined") {
+    afterGap();
+    return;
+  }
+  publicAudioQueue.push({ src, afterGap, tag });
+  drainPublicAudioQueue();
+}
+
+/** Remove pending jobs with `tag` and stop the current clip if it used that tag. */
+function cancelPublicAudioJobsWithTag(tag: string): void {
+  for (let i = publicAudioQueue.length - 1; i >= 0; i--) {
+    if (publicAudioQueue[i]!.tag === tag) {
+      publicAudioQueue.splice(i, 1);
+    }
+  }
+  if (
+    publicAudioBusy &&
+    publicAudioCurrentCleanup &&
+    publicAudioCurrentTag === tag
+  ) {
+    publicAudioCurrentCleanup();
+    publicAudioCurrentCleanup = null;
+    publicAudioCurrentTag = undefined;
+    publicAudioBusy = false;
+    drainPublicAudioQueue();
+  }
+}
+
+/** Clear all queued audio and stop whatever is playing (e.g. new deal / reset). */
+function cancelPublicAudioQueue(): void {
+  publicAudioQueue.length = 0;
+  if (publicAudioCurrentCleanup) {
+    publicAudioCurrentCleanup();
+    publicAudioCurrentCleanup = null;
+  }
+  publicAudioCurrentTag = undefined;
+  publicAudioBusy = false;
+}
+
+/** Turn callout: queued, then `onAfterGap`. Effect cleanup cancels only this tag. */
+function runAfterTurnClip(
+  which: "player" | "opponent",
+  onAfterGap: () => void,
+): () => void {
+  const src =
+    which === "player" ? PLAYERS_TURN_AUDIO_SRC : OPPONENTS_TURN_AUDIO_SRC;
+  enqueuePublicAudioEvent(src, onAfterGap, TURN_CALLOUT_AUDIO_TAG);
+  return () => cancelPublicAudioJobsWithTag(TURN_CALLOUT_AUDIO_TAG);
+}
 
 const STATS_STORAGE_KEY = "battleship-mini-stats-v1";
 
@@ -135,28 +283,46 @@ const DIFFICULTY_LABELS: Record<Difficulty, string> = {
   hard: "Hard",
 };
 
-type GameState = {
+type GameLoopPhase = "setup" | "playerTurn" | "aiTurn" | "gameOver";
+
+/** Whose firing turn it is; always derived from `gamePhase` (and `winner` when `gameOver`). */
+function mirroredCurrentTurn(
+  gamePhase: GameLoopPhase,
+  winner: "player" | "ai" | null,
+): "player" | "ai" {
+  if (gamePhase === "setup" || gamePhase === "playerTurn") return "player";
+  if (gamePhase === "aiTurn") return "ai";
+  return winner === "ai" ? "ai" : "player";
+}
+
+type ShipModel = {
+  positions: readonly number[];
+  hits: number;
+  size: number;
+};
+
+type BattleGameState = {
   /** Bumps on each new deal; used to apply win stats exactly once per game. */
   dealId: number;
   difficulty: Difficulty;
-  // All cells currently occupied by ships (length 3 and 2).
-  shipCells: Set<number>;
-  // Each individual ship as a list of its occupied cells.
-  // Index 0 is the length-3 ship; index 1 is the length-2 ship.
-  ships: number[][];
-  // All cells the player has already clicked (hits + misses).
-  shots: Set<number>;
-  // Subset of `shipCells` that have been hit.
-  hits: Set<number>;
+  gamePhase: GameLoopPhase;
+  /** Mirrored from `gamePhase` (and `winner` when `gamePhase === "gameOver"`). */
+  currentTurn: "player" | "ai";
+  playerShips: ShipModel[];
+  aiShips: ShipModel[];
+  /** Shots the player fired at the AI board (cell indices). */
+  playerShots: Set<number>;
+  /** Shots the AI fired at the player board (cell indices). */
+  aiShots: Set<number>;
   status: string;
-  isWon: boolean;
-  /** True when the player used all shots without sinking every ship. */
-  isLost: boolean;
-  /** Resets to 0 on any hit; used for optional miss-streak hints. */
+  /** Resets to 0 on any player hit on the opponent board; used for optional miss-streak hints. */
   consecutiveMisses: number;
-  // Used purely for UI feedback/animations.
-  lastCell: number | null;
+  lastOpponentBoardCell: number | null;
+  lastPlayerBoardCell: number | null;
   lastOutcome: OutcomeTone;
+  winner: "player" | "ai" | null;
+  /** After the turn clip finishes plus post-gap, player may shoot. */
+  playerFireEnabled: boolean;
 };
 
 const EXPLOSION_MAIN_DEGS = [0, 45, 90, 135, 180, 225, 270, 315] as const;
@@ -437,42 +603,118 @@ function getPlacements(length: number): number[][] {
 
 let nextDealId = 1;
 
-function createNewGame(difficulty: Difficulty): GameState {
-  const { shipCells, ships } = generateShipsForDifficulty(difficulty);
+function shipsToModels(ships: number[][]): ShipModel[] {
+  return ships.map((positions) => ({
+    positions,
+    hits: 0,
+    size: positions.length,
+  }));
+}
+
+function placePlayerShips(difficulty: Difficulty): ShipModel[] {
+  return shipsToModels(generateShipsForDifficulty(difficulty).ships);
+}
+
+function placeAiShips(difficulty: Difficulty): ShipModel[] {
+  return shipsToModels(generateShipsForDifficulty(difficulty).ships);
+}
+
+/** Random valid fleets for both sides (no overlap within each fleet; independent placements). */
+function placeShips(difficulty: Difficulty): {
+  playerShips: ShipModel[];
+  aiShips: ShipModel[];
+} {
+  return {
+    playerShips: placePlayerShips(difficulty),
+    aiShips: placeAiShips(difficulty),
+  };
+}
+
+function isFleetSunk(ships: ShipModel[]): boolean {
+  return ships.every((ship) => ship.hits === ship.size);
+}
+
+function fleetOccupiedCells(ships: ShipModel[]): Set<number> {
+  const s = new Set<number>();
+  for (const sh of ships) {
+    for (const c of sh.positions) s.add(c);
+  }
+  return s;
+}
+
+function incrementShipHitForCell(ships: ShipModel[], cell: number): ShipModel[] {
+  return ships.map((sh) =>
+    sh.positions.includes(cell) ? { ...sh, hits: sh.hits + 1 } : sh,
+  );
+}
+
+/** True when this hit is the last uncovered cell of that ship. */
+function isSinkingHitForCell(ships: ShipModel[], cell: number): boolean {
+  return ships.some(
+    (sh) => sh.positions.includes(cell) && sh.hits === sh.size - 1,
+  );
+}
+
+function checkWin(
+  playerShips: ShipModel[],
+  aiShips: ShipModel[],
+): "player" | "ai" | null {
+  if (isFleetSunk(aiShips)) return "player";
+  if (isFleetSunk(playerShips)) return "ai";
+  return null;
+}
+
+function createBattleState(difficulty: Difficulty): BattleGameState {
+  const { playerShips, aiShips } = placeShips(difficulty);
   const dealId = nextDealId++;
   return {
     dealId,
     difficulty,
-    shipCells,
-    ships,
-    shots: new Set<number>(),
-    hits: new Set<number>(),
-    status: "Take your shot",
-    isWon: false,
-    isLost: false,
+    gamePhase: "setup",
+    currentTurn: mirroredCurrentTurn("setup", null),
+    playerShips,
+    aiShips,
+    playerShots: new Set<number>(),
+    aiShots: new Set<number>(),
+    status: "Randomize your ships, then start the battle.",
     consecutiveMisses: 0,
-    lastCell: null,
+    lastOpponentBoardCell: null,
+    lastPlayerBoardCell: null,
     lastOutcome: "ready",
+    winner: null,
+    playerFireEnabled: false,
   };
 }
 
-/** True when at least one ship has been hit but not yet fully sunk. */
-function hasActiveHunt(game: GameState): boolean {
-  return game.ships.some((ship) => {
-    const onShip = ship.filter((c) => game.hits.has(c)).length;
-    return onShip > 0 && onShip < ship.length;
-  });
+/** True when at least one AI ship has been hit but not yet fully sunk. */
+function hasActiveHunt(game: BattleGameState): boolean {
+  return game.aiShips.some(
+    (ship) => ship.hits > 0 && ship.hits < ship.size,
+  );
 }
 
 /** Short rule-based hint from the current board (reflects the latest move). */
-function assistantTipForGame(game: GameState): string {
-  if (game.isWon) {
-    return "That was a strong finish — chase a lower shot count next time.";
+function assistantTipForGame(game: BattleGameState): string {
+  if (game.winner === "player") {
+    return "You sank their fleet — play again for a new layout.";
   }
-  if (game.isLost) {
-    return "Every miss still narrows the grid. Reset and try a different pattern.";
+  if (game.winner === "ai") {
+    return "They found your ships first. Randomize and try a different formation.";
   }
-  if (game.shots.size === 0) {
+  if (game.gamePhase === "setup") {
+    return "Use Randomize until you're happy, then start the battle.";
+  }
+  if (game.gamePhase === "aiTurn") {
+    return "Wait for the opponent's shot — watch your board.";
+  }
+  if (game.gamePhase === "playerTurn" && !game.playerFireEnabled) {
+    return "Stand by — you'll be able to fire right after the callout.";
+  }
+  if (
+    game.gamePhase === "playerTurn" &&
+    game.playerFireEnabled &&
+    game.playerShots.size === 0
+  ) {
     return "Fire when you're ready — I'll share a quick note after each shot.";
   }
 
@@ -494,6 +736,89 @@ function assistantTipForGame(game: GameState): string {
   }
 
   return "Keep going — you've got this.";
+}
+
+function applyPlayerFire(
+  prev: BattleGameState,
+  cellIndex: number,
+): BattleGameState {
+  const playerShots = new Set(prev.playerShots);
+  playerShots.add(cellIndex);
+  const onShip = prev.aiShips.some((s) => s.positions.includes(cellIndex));
+  if (!onShip) {
+    return {
+      ...prev,
+      playerShots,
+      consecutiveMisses: prev.consecutiveMisses + 1,
+      lastOpponentBoardCell: cellIndex,
+      lastOutcome: "miss",
+      status: "Miss!",
+      gamePhase: "aiTurn",
+      currentTurn: mirroredCurrentTurn("aiTurn", prev.winner),
+      winner: prev.winner,
+      playerFireEnabled: false,
+    };
+  }
+  const aiShips = incrementShipHitForCell(prev.aiShips, cellIndex);
+  const winner = checkWin(prev.playerShips, aiShips);
+  const nextPhase: GameLoopPhase = winner ? "gameOver" : "aiTurn";
+  const nextWinner = winner ?? prev.winner;
+  return {
+    ...prev,
+    playerShots,
+    aiShips,
+    consecutiveMisses: 0,
+    lastOpponentBoardCell: cellIndex,
+    lastOutcome: winner === "player" ? "sunk" : "hit",
+    status: winner === "player" ? "You sank their fleet!" : "Hit!",
+    gamePhase: nextPhase,
+    currentTurn: mirroredCurrentTurn(nextPhase, nextWinner),
+    winner: nextWinner,
+    playerFireEnabled: false,
+  };
+}
+
+function applyAiFire(prev: BattleGameState, cellIndex: number): BattleGameState {
+  const aiShots = new Set(prev.aiShots);
+  aiShots.add(cellIndex);
+  const onShip = prev.playerShips.some((s) => s.positions.includes(cellIndex));
+  if (!onShip) {
+    return {
+      ...prev,
+      aiShots,
+      lastPlayerBoardCell: cellIndex,
+      lastOutcome: "miss",
+      status: "They missed.",
+      gamePhase: "playerTurn",
+      currentTurn: mirroredCurrentTurn("playerTurn", prev.winner),
+      playerFireEnabled: false,
+    };
+  }
+  const playerShips = incrementShipHitForCell(prev.playerShips, cellIndex);
+  const winner = checkWin(playerShips, prev.aiShips);
+  const nextPhase: GameLoopPhase = winner ? "gameOver" : "playerTurn";
+  const nextWinner = winner ?? prev.winner;
+  return {
+    ...prev,
+    aiShots,
+    playerShips,
+    lastPlayerBoardCell: cellIndex,
+    lastOutcome: winner === "ai" ? "lost" : "hit",
+    status:
+      winner === "ai" ? "They sank your fleet!" : "They hit your ship!",
+    gamePhase: nextPhase,
+    currentTurn: mirroredCurrentTurn(nextPhase, nextWinner),
+    winner: nextWinner,
+    playerFireEnabled: false,
+  };
+}
+
+function pickRandomUnshotCell(shots: Set<number>): number {
+  const avail: number[] = [];
+  for (let i = 0; i < TOTAL_CELLS; i++) {
+    if (!shots.has(i)) avail.push(i);
+  }
+  return randPick(avail);
 }
 
 type ResetAnimPhase = "idle" | "fadeOut" | "fadeIn";
@@ -610,25 +935,38 @@ function readStoredWinFlair(
 
 const DIFFICULTY_ORDER = ["easy", "medium", "hard"] as const satisfies readonly Difficulty[];
 
+function explosionKey(board: "opponent" | "player", cell: number) {
+  return `${board}:${cell}`;
+}
+
 export default function Home() {
   const cells = useMemo(() => Array.from({ length: TOTAL_CELLS }, (_, i) => i), []);
   const [phase, setPhase] = useState<"setup" | "playing">("setup");
   const [pendingDifficulty, setPendingDifficulty] = useState<Difficulty>("medium");
-  const [game, setGame] = useState<GameState | null>(null);
+  const [game, setGame] = useState<BattleGameState | null>(null);
   const stats = useSyncExternalStore(
     subscribeStatsStore,
     getStatsStoreSnapshot,
     () => SERVER_STATS_SNAPSHOT,
   );
-  const [explodingCells, setExplodingCells] = useState<Set<number>>(() => new Set());
-  const explosionTimersRef = useRef<Map<number, ReturnType<typeof setTimeout>>>(new Map());
+  const [explodingCells, setExplodingCells] = useState<Set<string>>(
+    () => new Set(),
+  );
+  const explosionTimersRef = useRef<Map<string, ReturnType<typeof setTimeout>>>(
+    new Map(),
+  );
   const boomShotKeysRef = useRef<Set<string>>(new Set());
   const [resetAnim, setResetAnim] = useState<ResetAnimPhase>("idle");
   const resetFadeOutTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const gameRef = useRef<BattleGameState | null>(null);
+  /** Latest game for event handlers (synced during render — avoids useEffect lag vs state). */
+  gameRef.current = game;
+  /** Locks opponent grid until shot SFX queue finishes (flushSync so repeat clicks don’t slip through). */
+  const [opponentShotUiLocked, setOpponentShotUiLocked] = useState(false);
 
   useEffect(() => {
-    if (!game?.isWon) return;
-    const fingerprint = `${game.dealId}-${game.shots.size}`;
+    if (game?.winner !== "player") return;
+    const fingerprint = `${game.dealId}-${game.playerShots.size}`;
     if (typeof window !== "undefined") {
       try {
         if (sessionStorage.getItem(WIN_STATS_SESSION_KEY) === fingerprint) {
@@ -640,7 +978,7 @@ export default function Home() {
       }
     }
     const prev = readPersistedStats();
-    const shotsUsed = game.shots.size;
+    const shotsUsed = game.playerShots.size;
     const newBest = prev.bestShots === null || shotsUsed < prev.bestShots;
     const nextBest =
       prev.bestShots === null ? shotsUsed : Math.min(prev.bestShots, shotsUsed);
@@ -660,7 +998,7 @@ export default function Home() {
       /* ignore */
     }
     emitStatsStoreChange();
-  }, [game?.isWon, game?.shots.size, game?.dealId]);
+  }, [game?.winner, game?.playerShots.size, game?.dealId]);
 
   useEffect(() => {
     // These refs are mutated (we do not replace the underlying Map/Set),
@@ -696,148 +1034,215 @@ export default function Home() {
     };
   }, [resetAnim]);
 
-  const shipIndexByCell = useMemo(() => {
+  const aiShipIndexByCell = useMemo(() => {
     const map = new Map<number, number>();
     if (!game) return map;
-    game.ships.forEach((cellsOnShip, shipIdx) => {
-      cellsOnShip.forEach((cell) => map.set(cell, shipIdx));
+    game.aiShips.forEach((sh, shipIdx) => {
+      sh.positions.forEach((cell) => map.set(cell, shipIdx));
     });
     return map;
   }, [game]);
 
-  const sunkHullFragmentByCell = useMemo(() => {
+  const playerShipIndexByCell = useMemo(() => {
+    const map = new Map<number, number>();
+    if (!game) return map;
+    game.playerShips.forEach((sh, shipIdx) => {
+      sh.positions.forEach((cell) => map.set(cell, shipIdx));
+    });
+    return map;
+  }, [game]);
+
+  const sunkAiHullByCell = useMemo(() => {
     const map = new Map<number, HullFragment>();
     if (!game) return map;
-    for (const ship of game.ships) {
-      if (!ship.every((c) => game.hits.has(c))) continue;
-      hullFragmentsForShipCells(ship).forEach((frag, cell) => map.set(cell, frag));
+    for (const ship of game.aiShips) {
+      if (ship.hits < ship.size) continue;
+      hullFragmentsForShipCells([...ship.positions]).forEach((frag, cell) =>
+        map.set(cell, frag),
+      );
     }
     return map;
   }, [game]);
 
-  const triggerExplosionForCell = (cellIndex: number) => {
+  const sunkPlayerHullByCell = useMemo(() => {
+    const map = new Map<number, HullFragment>();
+    if (!game) return map;
+    for (const ship of game.playerShips) {
+      if (ship.hits < ship.size) continue;
+      hullFragmentsForShipCells([...ship.positions]).forEach((frag, cell) =>
+        map.set(cell, frag),
+      );
+    }
+    return map;
+  }, [game]);
+
+  const triggerExplosion = (key: string) => {
     setExplodingCells((prev) => {
       const next = new Set(prev);
-      next.add(cellIndex);
+      next.add(key);
       return next;
     });
 
-    const existing = explosionTimersRef.current.get(cellIndex);
+    const existing = explosionTimersRef.current.get(key);
     if (existing) clearTimeout(existing);
 
     const timer = setTimeout(() => {
       setExplodingCells((prev) => {
-        if (!prev.has(cellIndex)) return prev;
+        if (!prev.has(key)) return prev;
         const next = new Set(prev);
-        next.delete(cellIndex);
+        next.delete(key);
         return next;
       });
-      explosionTimersRef.current.delete(cellIndex);
+      explosionTimersRef.current.delete(key);
     }, EXPLOSION_MS);
 
-    explosionTimersRef.current.set(cellIndex, timer);
+    explosionTimersRef.current.set(key, timer);
   };
 
-  const handleCellClick = (cellIndex: number) => {
-    // Show explosion overlay immediately on the click that will be accepted (not inside `setGame`).
-    if (resetAnim !== "idle") return;
-    if (!game) return;
-    if (game.isWon || game.isLost) return;
-    if (game.shots.has(cellIndex)) return;
+  /** Fixed-length deps so React Fast Refresh never sees a changing hook-input arity. */
+  const turnEffectDeps = [
+    game,
+    game?.dealId,
+    game?.gamePhase,
+    game?.winner,
+    game?.playerShots.size,
+    game?.aiShots.size,
+    game?.playerFireEnabled,
+  ] as const;
 
-    const willBeHit = game.shipCells.has(cellIndex);
+  useEffect(() => {
+    if (!game || game.gamePhase !== "aiTurn" || game.winner) return;
+    const dealId = game.dealId;
+    const playerShotsAtStart = game.playerShots.size;
+    return runAfterTurnClip("opponent", () => {
+      const prev = gameRef.current;
+      if (
+        !prev ||
+        prev.gamePhase !== "aiTurn" ||
+        prev.winner ||
+        prev.dealId !== dealId ||
+        prev.playerShots.size !== playerShotsAtStart
+      ) {
+        return;
+      }
+      const cell = pickRandomUnshotCell(prev.aiShots);
+      const willHit = prev.playerShips.some((s) => s.positions.includes(cell));
+      const commitAiShot = () => {
+        const p = gameRef.current;
+        if (
+          !p ||
+          p.gamePhase !== "aiTurn" ||
+          p.winner ||
+          p.dealId !== dealId ||
+          p.playerShots.size !== playerShotsAtStart
+        ) {
+          return;
+        }
+        setGame(applyAiFire(p, cell));
+      };
+      if (willHit) {
+        const boomKey = `p:${cell}-${prev.aiShots.size}`;
+        if (!boomShotKeysRef.current.has(boomKey)) {
+          boomShotKeysRef.current.add(boomKey);
+          triggerExplosion(explosionKey("player", cell));
+        }
+        const sinking = isSinkingHitForCell(prev.playerShips, cell);
+        const previewNext = applyAiFire(prev, cell);
+        enqueuePublicAudioEvent(HIT_AUDIO_SRC, () => {
+          if (sinking) {
+            enqueuePublicAudioEvent(SUNK_BATTLESHIP_AUDIO_SRC, () => {
+              if (previewNext.winner === "ai") {
+                enqueuePublicAudioEvent(SUNK_FLEET_AUDIO_SRC, commitAiShot);
+              } else {
+                commitAiShot();
+              }
+            });
+          } else {
+            commitAiShot();
+          }
+        });
+        return;
+      }
+      enqueuePublicAudioEvent(MISS_AUDIO_SRC, commitAiShot);
+    });
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- use turnEffectDeps tuple above
+  }, turnEffectDeps);
+
+  useEffect(() => {
+    if (!game || game.gamePhase !== "playerTurn" || game.winner) return;
+    if (game.playerFireEnabled) return;
+    const dealId = game.dealId;
+    const aiShotsAtStart = game.aiShots.size;
+    return runAfterTurnClip("player", () => {
+      setGame((prev) => {
+        if (
+          !prev ||
+          prev.gamePhase !== "playerTurn" ||
+          prev.winner ||
+          prev.dealId !== dealId ||
+          prev.aiShots.size !== aiShotsAtStart
+        ) {
+          return prev;
+        }
+        if (prev.playerFireEnabled) return prev;
+        return { ...prev, playerFireEnabled: true };
+      });
+    });
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- use turnEffectDeps tuple above
+  }, turnEffectDeps);
+
+  const handleOpponentCellClick = (cellIndex: number) => {
+    if (resetAnim !== "idle") return;
+    const g = gameRef.current;
+    if (!g) return;
+    if (g.gamePhase !== "playerTurn" || g.winner) return;
+    if (!g.playerFireEnabled) return;
+    if (g.playerShots.has(cellIndex)) return;
+    if (opponentShotUiLocked) return;
+
+    flushSync(() => {
+      setOpponentShotUiLocked(true);
+    });
+
+    const finishPlayerShot = () => {
+      try {
+        setGame((prev) => {
+          if (!prev || prev.gamePhase !== "playerTurn" || prev.winner) return prev;
+          if (!prev.playerFireEnabled) return prev;
+          if (prev.playerShots.has(cellIndex)) return prev;
+          return applyPlayerFire(prev, cellIndex);
+        });
+      } finally {
+        setOpponentShotUiLocked(false);
+      }
+    };
+
+    const willBeHit = g.aiShips.some((s) => s.positions.includes(cellIndex));
     if (willBeHit) {
-      const boomKey = `${cellIndex}-${game.shots.size}`;
+      const boomKey = `o:${cellIndex}-${g.playerShots.size}`;
       if (!boomShotKeysRef.current.has(boomKey)) {
         boomShotKeysRef.current.add(boomKey);
-        triggerExplosionForCell(cellIndex);
+        triggerExplosion(explosionKey("opponent", cellIndex));
       }
+      const sinking = isSinkingHitForCell(g.aiShips, cellIndex);
+      const previewNext = applyPlayerFire(g, cellIndex);
+      enqueuePublicAudioEvent(HIT_AUDIO_SRC, () => {
+        if (sinking) {
+          enqueuePublicAudioEvent(SUNK_BATTLESHIP_AUDIO_SRC, () => {
+            if (previewNext.winner === "player") {
+              enqueuePublicAudioEvent(SUNK_FLEET_AUDIO_SRC, finishPlayerShot);
+            } else {
+              finishPlayerShot();
+            }
+          });
+        } else {
+          finishPlayerShot();
+        }
+      });
+      return;
     }
 
-    setGame((prev) => {
-      if (!prev) return prev;
-      // Game is over; keep the end message visible and stop accepting shots.
-      if (prev.isWon || prev.isLost) return prev;
-      // Prevent clicking the same cell twice.
-      if (prev.shots.has(cellIndex)) return prev;
-
-      const shots = new Set(prev.shots);
-      shots.add(cellIndex);
-
-      const isHit = prev.shipCells.has(cellIndex);
-      const hits = new Set(prev.hits);
-      const lastCell = cellIndex;
-
-      const outOfShots = (nextHits: Set<number>) =>
-        shots.size >= SHOT_LIMIT && nextHits.size < prev.shipCells.size;
-
-      const nextConsecutiveMisses = prev.consecutiveMisses + 1;
-
-      if (!isHit) {
-        if (outOfShots(hits)) {
-          return {
-            ...prev,
-            shots,
-            hits,
-            status: "No shots left",
-            isWon: false,
-            isLost: true,
-            consecutiveMisses: nextConsecutiveMisses,
-            lastCell,
-            lastOutcome: "lost",
-          };
-        }
-        return {
-          ...prev,
-          shots,
-          hits,
-          status: "Miss!",
-          isWon: false,
-          consecutiveMisses: nextConsecutiveMisses,
-          lastCell,
-          lastOutcome: "miss",
-        };
-      }
-
-      hits.add(cellIndex);
-      const sunkAll = hits.size === prev.shipCells.size;
-      if (sunkAll) {
-        return {
-          ...prev,
-          shots,
-          hits,
-          status: `Cleared in ${shots.size} shot${shots.size === 1 ? "" : "s"}`,
-          isWon: true,
-          isLost: false,
-          consecutiveMisses: 0,
-          lastCell,
-          lastOutcome: "sunk",
-        };
-      }
-      if (outOfShots(hits)) {
-        return {
-          ...prev,
-          shots,
-          hits,
-          status: "No shots left",
-          isWon: false,
-          isLost: true,
-          consecutiveMisses: 0,
-          lastCell,
-          lastOutcome: "lost",
-        };
-      }
-      return {
-        ...prev,
-        shots,
-        hits,
-        status: "Hit!",
-        isWon: false,
-        consecutiveMisses: 0,
-        lastCell,
-        lastOutcome: "hit",
-      };
-    });
+    enqueuePublicAudioEvent(MISS_AUDIO_SRC, finishPlayerShot);
   };
 
   const applyNewGameState = () => {
@@ -845,8 +1250,10 @@ export default function Home() {
     explosionTimersRef.current.clear();
     setExplodingCells(new Set());
     boomShotKeysRef.current.clear();
+    setOpponentShotUiLocked(false);
+    cancelPublicAudioQueue();
     const d = game?.difficulty ?? pendingDifficulty;
-    setGame(createNewGame(d));
+    setGame(createBattleState(d));
   };
 
   const startNewGameWithTransition = (requireConfirm: boolean) => {
@@ -854,7 +1261,10 @@ export default function Home() {
     if (!game) return;
 
     const hasProgress =
-      game.shots.size > 0 || game.isWon || game.isLost;
+      game.gamePhase !== "setup" ||
+      game.winner !== null ||
+      game.playerShots.size > 0 ||
+      game.aiShots.size > 0;
     if (
       requireConfirm &&
       hasProgress &&
@@ -886,24 +1296,51 @@ export default function Home() {
 
   const handleReset = () => startNewGameWithTransition(true);
 
-  const handlePlayAgain = () => startNewGameWithTransition(false);
+  const handleRestartGame = () => startNewGameWithTransition(false);
 
   const handleStartFromSetup = () => {
-    setGame(createNewGame(pendingDifficulty));
+    setGame(createBattleState(pendingDifficulty));
     setPhase("playing");
   };
 
   const canRedealSamePhase =
-    game !== null &&
-    game.shots.size === 0 &&
-    !game.isWon &&
-    !game.isLost;
+    game !== null && game.gamePhase === "setup" && game.winner === null;
 
-  const applyDifficultyBeforeFirstShot = (d: Difficulty) => {
+  const applyDifficultyInSetup = (d: Difficulty) => {
     setPendingDifficulty(d);
     if (canRedealSamePhase) {
-      setGame(createNewGame(d));
+      setGame(createBattleState(d));
     }
+  };
+
+  const handleRandomizeShips = () => {
+    if (!game || resetAnim !== "idle") return;
+    if (game.gamePhase !== "setup") return;
+    setGame((prev) => {
+      if (!prev || prev.gamePhase !== "setup") return prev;
+      return {
+        ...prev,
+        playerShips: placePlayerShips(prev.difficulty),
+        status: "Fleet randomized — start when ready.",
+        lastOutcome: "ready",
+      };
+    });
+  };
+
+  const handleStartBattle = () => {
+    if (!game || resetAnim !== "idle") return;
+    if (game.gamePhase !== "setup") return;
+    setGame((prev) => {
+      if (!prev || prev.gamePhase !== "setup") return prev;
+      return {
+        ...prev,
+        gamePhase: "playerTurn",
+        currentTurn: mirroredCurrentTurn("playerTurn", null),
+        playerFireEnabled: false,
+        status: "Your turn — pick a cell on the opponent board.",
+        lastOutcome: "ready",
+      };
+    });
   };
 
   const handleBackToDifficulty = () => {
@@ -912,7 +1349,10 @@ export default function Home() {
       return;
     }
     const hasProgress =
-      game.shots.size > 0 || game.isWon || game.isLost;
+      game.gamePhase !== "setup" ||
+      game.winner !== null ||
+      game.playerShots.size > 0 ||
+      game.aiShots.size > 0;
     if (
       hasProgress &&
       typeof window !== "undefined" &&
@@ -938,56 +1378,78 @@ export default function Home() {
 
   const playing = phase === "playing" && game !== null;
 
+  const aiOccupiedCells = useMemo(
+    () => (game ? fleetOccupiedCells(game.aiShips) : new Set<number>()),
+    [game],
+  );
+  const playerOccupiedCells = useMemo(
+    () => (game ? fleetOccupiedCells(game.playerShips) : new Set<number>()),
+    [game],
+  );
+
   const statusDotTone =
     !game
       ? "bg-teal-400 shadow-[0_0_18px_rgba(45,212,191,0.55)]"
       : game.lastOutcome === "miss"
-      ? "bg-slate-400 shadow-[0_0_14px_rgba(148,163,184,0.45)]"
-      : game.lastOutcome === "hit"
-        ? "bg-rose-400 shadow-[0_0_20px_rgba(251,113,133,0.75)]"
-        : game.lastOutcome === "sunk"
-          ? "bg-amber-400 shadow-[0_0_22px_rgba(251,191,36,0.65)]"
-          : game.lastOutcome === "lost"
-            ? "bg-red-500/90 shadow-[0_0_18px_rgba(239,68,68,0.5)]"
-            : "bg-teal-400 shadow-[0_0_18px_rgba(45,212,191,0.55)]";
+        ? "bg-slate-400 shadow-[0_0_14px_rgba(148,163,184,0.45)]"
+        : game.lastOutcome === "hit"
+          ? "bg-rose-400 shadow-[0_0_20px_rgba(251,113,133,0.75)]"
+          : game.lastOutcome === "sunk"
+            ? "bg-amber-400 shadow-[0_0_22px_rgba(251,191,36,0.65)]"
+            : game.lastOutcome === "lost"
+              ? "bg-red-500/90 shadow-[0_0_18px_rgba(239,68,68,0.5)]"
+              : "bg-teal-400 shadow-[0_0_18px_rgba(45,212,191,0.55)]";
 
   const statusTextTone =
     !game
       ? "text-white"
       : game.lastOutcome === "miss"
-      ? "text-slate-200"
-      : game.lastOutcome === "hit"
-        ? "text-rose-50"
-        : game.lastOutcome === "sunk"
-          ? "text-amber-50"
-          : game.lastOutcome === "lost"
-            ? "text-red-100"
-            : "text-white";
+        ? "text-slate-200"
+        : game.lastOutcome === "hit"
+          ? "text-rose-50"
+          : game.lastOutcome === "sunk"
+            ? "text-amber-50"
+            : game.lastOutcome === "lost"
+              ? "text-red-100"
+              : "text-white";
 
-  const shotsRemaining = game
-    ? Math.max(0, SHOT_LIMIT - game.shots.size)
-    : SHOT_LIMIT;
-  const gameEnded = game ? game.isWon || game.isLost : false;
+  const gameEnded = game ? game.winner !== null : false;
   const winFingerprint =
-    game?.isWon ? `${game.dealId}-${game.shots.size}` : null;
+    game?.winner === "player"
+      ? `${game.dealId}-${game.playerShots.size}`
+      : null;
   const storedWinFlair = readStoredWinFlair(winFingerprint);
   const beatPersonalBest =
     !!game &&
-    game.isWon &&
+    game.winner === "player" &&
     (storedWinFlair?.newBest === true ||
       (storedWinFlair === null &&
-        (stats.bestShots === null || game.shots.size < stats.bestShots)));
+        (stats.bestShots === null ||
+          game.playerShots.size < stats.bestShots)));
   const wonAboveBestRecord =
     !!game &&
-    game.isWon &&
+    game.winner === "player" &&
     stats.bestShots !== null &&
-    game.shots.size > stats.bestShots;
+    game.playerShots.size > stats.bestShots;
   const showShipAdjacencyHint =
     !!game &&
     !gameEnded &&
+    game.gamePhase === "playerTurn" &&
+    game.playerFireEnabled &&
     game.consecutiveMisses >= CONSECUTIVE_MISS_HINT_AFTER &&
     resetAnim === "idle";
   const isResetting = resetAnim !== "idle";
+
+  const turnIndicator =
+    !game || game.gamePhase === "setup"
+      ? "Arrange your fleet"
+      : game.gamePhase === "aiTurn"
+        ? "Stand by"
+        : game.gamePhase === "playerTurn" && !game.playerFireEnabled
+          ? "Stand by"
+          : game.gamePhase === "playerTurn"
+            ? "Your Turn"
+            : "Stand by";
 
   return (
     <div className="relative min-h-screen overflow-x-hidden text-white flex flex-col items-center px-4 py-10 sm:py-12 bg-gradient-to-b from-[#070b14] via-[#0c1526] to-[#0a1220]">
@@ -1000,7 +1462,7 @@ export default function Home() {
           Battleship
         </h1>
         <p className="mt-2 text-slate-400/95 text-sm sm:text-base">
-          Find and sink all hidden ships
+          Sink the enemy fleet before they sink yours
         </p>
         {stats.wins > 0 && (
           <p className="mt-3 text-xs sm:text-sm text-slate-500/90 tabular-nums tracking-wide">
@@ -1089,17 +1551,17 @@ export default function Home() {
         )}
         {playing && game && (
           <>
-        {game.isWon && (
+        {game.winner === "player" && (
           <div className="w-full mb-5 rounded-2xl border border-amber-400/30 bg-gradient-to-br from-amber-500/15 to-orange-600/10 px-5 py-4 shadow-[0_0_48px_rgba(251,191,36,0.15)]">
-            <div className="flex items-start justify-between gap-4">
+            <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
               <div>
-                <div className="text-sm font-semibold tracking-wide text-amber-100">
-                  You win!
+                <div className="text-lg font-bold tracking-tight text-amber-100">
+                  You Win!
                 </div>
                 <div className="mt-1 text-sm text-slate-300">
                   {beatPersonalBest ? (
                     <span className="text-amber-100/95">
-                      New personal best — see if you can go lower.
+                      New personal best — fewer shots to win.
                     </span>
                   ) : wonAboveBestRecord ? (
                     <>
@@ -1107,36 +1569,40 @@ export default function Home() {
                       {stats.bestShots === 1 ? "" : "s"}. Try again?
                     </>
                   ) : (
-                    <>
-                      All ships sunk. Reset for a fresh grid — chase a lower
-                      shot count.
-                    </>
+                    <span>All enemy ships sunk.</span>
                   )}
                 </div>
               </div>
-              <div className="text-xs font-medium text-amber-200/90 tabular-nums shrink-0 text-right leading-snug">
-                <div>
-                  Used {game.shots.size}/{SHOT_LIMIT}
-                </div>
-                <div className="text-amber-200/60">shots</div>
-              </div>
+              <button
+                type="button"
+                onClick={handleRestartGame}
+                disabled={isResetting}
+                className="shrink-0 rounded-xl border border-amber-300/40 bg-amber-500/15 px-5 py-2.5 text-sm font-semibold text-amber-50 transition-[background-color,border-color] duration-200 hover:bg-amber-500/25 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-amber-400/50 disabled:opacity-60"
+              >
+                Restart Game
+              </button>
             </div>
           </div>
         )}
-        {game.isLost && (
+        {game.winner === "ai" && (
           <div className="w-full mb-5 rounded-2xl border border-red-500/35 bg-gradient-to-br from-red-950/40 to-slate-950/50 px-5 py-4 shadow-[0_0_48px_rgba(239,68,68,0.12)]">
-            <div className="flex items-start justify-between gap-4">
+            <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
               <div>
-                <div className="text-sm font-semibold tracking-wide text-red-200">
-                  Game Over
+                <div className="text-lg font-bold tracking-tight text-red-100">
+                  You Lose!
                 </div>
                 <div className="mt-1 text-sm text-slate-400">
-                  Out of shots with ships still afloat. Press Reset to try again.
+                  The opponent sank your fleet first.
                 </div>
               </div>
-              <div className="text-xs font-medium text-red-200/80 tabular-nums">
-                Shots left: {shotsRemaining}/{SHOT_LIMIT}
-              </div>
+              <button
+                type="button"
+                onClick={handleRestartGame}
+                disabled={isResetting}
+                className="shrink-0 rounded-xl border border-red-400/35 bg-red-500/15 px-5 py-2.5 text-sm font-semibold text-red-50 transition-[background-color,border-color] duration-200 hover:bg-red-500/25 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-red-400/50 disabled:opacity-60"
+              >
+                Restart Game
+              </button>
             </div>
           </div>
         )}
@@ -1146,59 +1612,83 @@ export default function Home() {
           aria-live="polite"
         >
           <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between sm:gap-4">
-            <div className="flex items-center justify-center gap-3 sm:justify-start min-h-[2.75rem] sm:min-h-0">
-              <span
-                className={[
-                  "inline-block h-3.5 w-3.5 shrink-0 rounded-full transition-all duration-500 ease-out",
-                  statusDotTone,
-                ].join(" ")}
-              />
-              <p
-                className={[
-                  "text-xl sm:text-2xl font-bold tracking-tight leading-snug text-center sm:text-left drop-shadow-[0_2px_12px_rgba(0,0,0,0.35)]",
-                  statusTextTone,
-                ].join(" ")}
-              >
-                {game.status}
-              </p>
+            <div className="flex flex-1 flex-col gap-1 min-h-[2.75rem] sm:min-h-0">
+              {!gameEnded && (
+                <p className="text-center text-[11px] font-semibold uppercase tracking-[0.2em] text-teal-300/90 sm:text-left">
+                  {turnIndicator}
+                </p>
+              )}
+              <div className="flex items-center justify-center gap-3 sm:justify-start">
+                <span
+                  className={[
+                    "inline-block h-3.5 w-3.5 shrink-0 rounded-full transition-all duration-500 ease-out",
+                    statusDotTone,
+                  ].join(" ")}
+                />
+                <p
+                  className={[
+                    "text-xl sm:text-2xl font-bold tracking-tight leading-snug text-center sm:text-left drop-shadow-[0_2px_12px_rgba(0,0,0,0.35)]",
+                    statusTextTone,
+                  ].join(" ")}
+                >
+                  {game.status}
+                </p>
+              </div>
             </div>
             <div className="flex flex-col items-center gap-1 sm:items-end">
               <span className="text-center sm:text-right text-xs font-semibold uppercase tracking-wider text-slate-500 tabular-nums">
                 6×6
               </span>
-              <span className="text-center sm:text-right text-xs font-semibold tabular-nums text-teal-200/90">
-                Shots left: {shotsRemaining}/{SHOT_LIMIT}
-              </span>
             </div>
           </div>
           {canRedealSamePhase && (
-            <div className="mt-4 flex flex-wrap items-center justify-center gap-2 border-t border-white/[0.08] pt-4">
-              <span className="w-full text-center text-[10px] font-semibold uppercase tracking-wider text-slate-500 sm:w-auto sm:text-left">
-                New fleet (no shots yet)
-              </span>
-              <div
-                className="flex flex-wrap justify-center gap-1.5"
-                role="group"
-                aria-label="Redeal difficulty"
-              >
-                {DIFFICULTY_ORDER.map((d) => {
-                  const active = game.difficulty === d;
-                  return (
-                    <button
-                      key={d}
-                      type="button"
-                      onClick={() => applyDifficultyBeforeFirstShot(d)}
-                      className={[
-                        "rounded-lg border px-2.5 py-1 text-[11px] font-semibold transition-[background-color,border-color,color] duration-150",
-                        active
-                          ? "border-teal-400/50 bg-teal-500/25 text-teal-50"
-                          : "border-white/10 bg-white/[0.04] text-slate-400 hover:border-white/20 hover:text-slate-300",
-                      ].join(" ")}
-                    >
-                      {DIFFICULTY_LABELS[d]}
-                    </button>
-                  );
-                })}
+            <div className="mt-4 flex flex-col gap-3 border-t border-white/[0.08] pt-4">
+              <div className="flex flex-col gap-2 sm:flex-row sm:flex-wrap sm:items-center sm:justify-center">
+                <button
+                  type="button"
+                  onClick={handleRandomizeShips}
+                  disabled={isResetting}
+                  className="w-full rounded-xl border border-white/15 bg-white/[0.06] px-4 py-2.5 text-sm font-semibold text-slate-100 transition-[background-color,border-color] duration-200 hover:border-teal-300/35 hover:bg-teal-500/10 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-teal-400/50 sm:w-auto"
+                >
+                  Randomize ships
+                </button>
+                <button
+                  type="button"
+                  onClick={handleStartBattle}
+                  disabled={isResetting}
+                  className="w-full rounded-xl border border-teal-400/35 bg-teal-500/20 px-4 py-2.5 text-sm font-semibold text-teal-50 transition-[background-color,border-color] duration-200 hover:bg-teal-500/30 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-teal-400/60 sm:w-auto"
+                >
+                  Start battle
+                </button>
+              </div>
+              <div className="flex flex-wrap items-center justify-center gap-2">
+                <span className="w-full text-center text-[10px] font-semibold uppercase tracking-wider text-slate-500 sm:w-auto">
+                  Difficulty
+                </span>
+                <div
+                  className="flex flex-wrap justify-center gap-1.5"
+                  role="group"
+                  aria-label="Fleet difficulty"
+                >
+                  {DIFFICULTY_ORDER.map((d) => {
+                    const active = game.difficulty === d;
+                    return (
+                      <button
+                        key={d}
+                        type="button"
+                        onClick={() => applyDifficultyInSetup(d)}
+                        className={[
+                          "rounded-lg border px-2.5 py-1 text-[11px] font-semibold transition-[background-color,border-color,color] duration-150",
+                          active
+                            ? "border-teal-400/50 bg-teal-500/25 text-teal-50"
+                            : "border-white/10 bg-white/[0.04] text-slate-400 hover:border-white/20 hover:text-slate-300",
+                        ].join(" ")}
+                      >
+                        {DIFFICULTY_LABELS[d]}
+                      </button>
+                    );
+                  })}
+                </div>
               </div>
             </div>
           )}
@@ -1227,13 +1717,12 @@ export default function Home() {
           </p>
         </div>
 
-        <div className="mt-7 w-full flex flex-col items-center gap-2.5">
-          <div className="w-full text-center text-xs font-semibold tracking-[0.2em] uppercase text-slate-500">
-            Target grid
-          </div>
+        <div className="mt-7 w-full flex flex-col items-center gap-8">
           <div
             className="flex flex-wrap items-center justify-center gap-x-3 gap-y-2 text-xs text-slate-400"
-            aria-label={`Legend: hit and miss colors${game.isLost ? ", ship revealed" : ""}`}
+            aria-label={`Legend: hit and miss colors${
+              game.winner === "ai" ? ", ship revealed" : ""
+            }`}
           >
             <span className="inline-flex items-center gap-2">
               <span
@@ -1249,7 +1738,7 @@ export default function Home() {
               />
               <span>Miss</span>
             </span>
-            {game.isLost && (
+            {game.winner === "ai" && (
               <span className="inline-flex items-center gap-2">
                 <span
                   className="h-4 w-4 shrink-0 rounded border border-teal-300/25 bg-teal-400/10 shadow-[0_0_12px_rgba(45,212,191,0.18)]"
@@ -1259,161 +1748,308 @@ export default function Home() {
               </span>
             )}
           </div>
-          <div
-            className="mx-auto w-full max-w-[min(92vw,420px)] rounded-2xl border border-white/10 bg-white/[0.04] p-4 sm:p-5 shadow-[inset_0_1px_0_rgba(255,255,255,0.05)]"
-            aria-hidden
-          >
+
+          <div className="w-full flex flex-col gap-2">
+            <div className="text-center text-xs font-semibold tracking-[0.2em] uppercase text-slate-500">
+              Opponent board
+            </div>
             <div
-              role="grid"
-              aria-label="Battleship 6 by 6 grid"
-              aria-disabled={gameEnded || isResetting}
-              className={[
-                "mx-auto grid w-full max-w-[min(100%,360px)] grid-cols-6 gap-2 sm:gap-2",
-                gameEnded || isResetting ? "pointer-events-none" : "",
-              ].join(" ")}
+              className="mx-auto w-full max-w-[min(92vw,420px)] rounded-2xl border border-white/10 bg-white/[0.04] p-4 sm:p-5 shadow-[inset_0_1px_0_rgba(255,255,255,0.05)]"
+              aria-hidden
             >
-              {cells.map((i) => {
-                const isHit = game.hits.has(i);
-                const isShot = game.shots.has(i);
-                const isMiss = isShot && !isHit;
-                const isShip = game.shipCells.has(i);
-                const isShipFound = game.isWon && isShip;
-                const isShipRevealed = game.isLost && isShip && !isShot;
-                const didJustClick = game.lastCell === i && isShot;
-                const isExploding = explodingCells.has(i);
-                const shipIdx = shipIndexByCell.get(i) ?? null;
-                const sunkHullFragment = sunkHullFragmentByCell.get(i);
+              <div
+                role="grid"
+                aria-label="Opponent battleship grid"
+                aria-busy={opponentShotUiLocked}
+                aria-disabled={
+                  gameEnded ||
+                  isResetting ||
+                  opponentShotUiLocked ||
+                  game.gamePhase !== "playerTurn" ||
+                  !game.playerFireEnabled
+                }
+                className={[
+                  "mx-auto grid w-full max-w-[min(100%,360px)] grid-cols-6 gap-2 sm:gap-2",
+                  gameEnded ||
+                  isResetting ||
+                  opponentShotUiLocked ||
+                  game.gamePhase !== "playerTurn" ||
+                  !game.playerFireEnabled
+                    ? "pointer-events-none"
+                    : "",
+                ].join(" ")}
+              >
+                {cells.map((i) => {
+                  const isShot = game.playerShots.has(i);
+                  const isHit = isShot && aiOccupiedCells.has(i);
+                  const isMiss = isShot && !isHit;
+                  const isShip = aiOccupiedCells.has(i);
+                  const isShipFound = game.winner === "player" && isShip;
+                  const isShipRevealed =
+                    game.winner === "ai" && isShip && !isShot;
+                  const didJustClick =
+                    game.lastOpponentBoardCell === i && isShot;
+                  const isExploding = explodingCells.has(
+                    explosionKey("opponent", i),
+                  );
+                  const shipIdx = aiShipIndexByCell.get(i) ?? null;
+                  const sunkHullFragment = sunkAiHullByCell.get(i);
 
-                const cellBase =
-                  "group relative aspect-square rounded-lg border transform-gpu focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-teal-400/70 focus-visible:ring-offset-2 focus-visible:ring-offset-[#0c1526] transition-[background-color,border-color,box-shadow,transform,opacity,filter] duration-300 ease-out active:scale-[0.96]";
+                  const cellBase =
+                    "group relative aspect-square rounded-lg border transform-gpu focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-teal-400/70 focus-visible:ring-offset-2 focus-visible:ring-offset-[#0c1526] transition-[background-color,border-color,box-shadow,transform,opacity,filter] duration-300 ease-out active:scale-[0.96]";
 
-                const cellTone = isHit
-                  ? // Hit: reward with strong color + subtle pulse.
-                    "border-rose-300/85 bg-gradient-to-br from-rose-500/62 via-rose-600/36 to-orange-700/28 shadow-[0_0_30px_rgba(244,63,94,0.52),inset_0_1px_0_rgba(255,255,255,0.14)]"
-                  : isShipFound
-                    ? // Win: highlight the full ships the player found.
-                      shipIdx === 0
-                      ? "border-amber-200/75 bg-gradient-to-br from-amber-500/35 via-orange-400/18 to-orange-600/6 shadow-[0_0_34px_rgba(251,191,36,0.40),inset_0_1px_0_rgba(255,255,255,0.15)]"
-                      : "border-amber-200/70 bg-gradient-to-br from-amber-500/30 via-amber-300/12 to-orange-600/5 shadow-[0_0_30px_rgba(251,191,36,0.35),inset_0_1px_0_rgba(255,255,255,0.13)]"
-                    : isMiss
-                      ? // Miss: clear but less intense.
-                        "border-slate-400/40 bg-slate-900/35 shadow-[0_2px_10px_rgba(15,23,42,0.26)]"
+                  const cellTone = isHit
+                    ? "border-rose-300/85 bg-gradient-to-br from-rose-500/62 via-rose-600/36 to-orange-700/28 shadow-[0_0_30px_rgba(244,63,94,0.52),inset_0_1px_0_rgba(255,255,255,0.14)]"
+                    : isShipFound
+                      ? shipIdx === 0
+                        ? "border-amber-200/75 bg-gradient-to-br from-amber-500/35 via-orange-400/18 to-orange-600/6 shadow-[0_0_34px_rgba(251,191,36,0.40),inset_0_1px_0_rgba(255,255,255,0.15)]"
+                        : "border-amber-200/70 bg-gradient-to-br from-amber-500/30 via-amber-300/12 to-orange-600/5 shadow-[0_0_30px_rgba(251,191,36,0.35),inset_0_1px_0_rgba(255,255,255,0.13)]"
+                      : isMiss
+                        ? "border-slate-400/40 bg-slate-900/35 shadow-[0_2px_10px_rgba(15,23,42,0.26)]"
+                        : isShipRevealed
+                          ? "border-teal-300/25 bg-teal-400/10 shadow-[0_0_22px_rgba(45,212,191,0.18),inset_0_1px_0_rgba(255,255,255,0.10)]"
+                          : "border-white/12 bg-white/[0.07] shadow-[inset_0_1px_0_rgba(255,255,255,0.06)]";
+
+                  const oppInteractive =
+                    game.gamePhase === "playerTurn" &&
+                    game.playerFireEnabled &&
+                    !gameEnded &&
+                    !opponentShotUiLocked;
+                  const cellHover =
+                    !isShot && oppInteractive
+                      ? "hover:-translate-y-px hover:bg-teal-400/12 hover:border-teal-300/35 hover:shadow-[0_0_20px_rgba(45,212,191,0.12)]"
+                      : "";
+
+                  const cellInteractivity =
+                    isShot || !oppInteractive || gameEnded
+                      ? "cursor-not-allowed"
+                      : "";
+
+                  const shotDim = isShot && !didJustClick ? "opacity-[0.88]" : "";
+
+                  const cellClickAnim = didJustClick
+                    ? isHit
+                      ? "motion-reduce:animate-none animate-[hit-impact_0.48s_cubic-bezier(0.34,1.45,0.64,1)_forwards]"
+                      : "motion-reduce:animate-none animate-[miss-settle_0.45s_ease-out_forwards]"
+                    : "";
+
+                  const markAnim = isHit
+                    ? isExploding
+                      ? "motion-reduce:animate-none animate-[explosion-burst_0.3s_ease-out_forwards]"
+                      : didJustClick
+                        ? "motion-reduce:animate-none animate-[mark-hit_0.4s_cubic-bezier(0.34,1.45,0.64,1)_forwards]"
+                        : "transition-opacity duration-300 ease-out"
+                    : didJustClick
+                      ? "motion-reduce:animate-none animate-[mark-miss_0.45s_ease-out_forwards]"
+                      : "transition-opacity duration-300 ease-out";
+
+                  const revealAnim = isShipRevealed
+                    ? "motion-reduce:animate-none animate-[ship-reveal_0.55s_ease-out_forwards]"
+                    : "";
+
+                  const winAnim = isShipFound
+                    ? "motion-reduce:animate-none animate-[ship-win_0.85s_ease-out_forwards]"
+                    : "";
+
+                  const cellIcon =
+                    isHit
+                      ? "text-rose-50"
                       : isShipRevealed
-                        ? // Loss: reveal ship positions (but don't overpower confirmed hits).
-                          "border-teal-300/25 bg-teal-400/10 shadow-[0_0_22px_rgba(45,212,191,0.18),inset_0_1px_0_rgba(255,255,255,0.10)]"
+                        ? "text-teal-50/70"
+                        : "text-slate-400/95";
+
+                  return (
+                    <button
+                      key={`o-${i}`}
+                      type="button"
+                      role="gridcell"
+                      aria-label={`Opponent cell ${i + 1}${
+                        game.winner === "ai" && isShip && !isShot
+                          ? ", ship revealed"
+                          : game.winner === "player" && isShip
+                            ? ", ship found"
+                            : isHit
+                              ? ", hit"
+                              : isMiss
+                                ? ", miss"
+                                : ""
+                      }`}
+                      disabled={
+                        isShot ||
+                        gameEnded ||
+                        isResetting ||
+                        opponentShotUiLocked ||
+                        game.gamePhase !== "playerTurn" ||
+                        !game.playerFireEnabled
+                      }
+                      onClick={() => handleOpponentCellClick(i)}
+                      className={[
+                        cellBase,
+                        cellTone,
+                        cellHover,
+                        cellInteractivity,
+                        shotDim,
+                        cellClickAnim,
+                        revealAnim,
+                        winAnim,
+                      ].join(" ")}
+                    >
+                      {sunkHullFragment && (
+                        <ShipOutlineWatermark fragment={sunkHullFragment} />
+                      )}
+                      {isShot && (
+                        <span
+                          aria-hidden
+                          className={[
+                            "pointer-events-none absolute inset-0 z-[2] flex items-center justify-center font-bold",
+                            isHit && isExploding
+                              ? "text-amber-100 drop-shadow-[0_0_16px_rgba(251,191,36,0.95),0_0_32px_rgba(248,113,113,0.55),0_0_48px_rgba(251,146,60,0.35)]"
+                              : isHit
+                                ? `text-2xl drop-shadow-md ${cellIcon}`
+                                : "text-lg font-semibold text-slate-400/95 drop-shadow-md",
+                            markAnim,
+                          ].join(" ")}
+                        >
+                          {isHit ? (isExploding ? <ExplosionIcon /> : "✕") : "○"}
+                        </span>
+                      )}
+                      {!isShot && isShipRevealed && (
+                        <span
+                          aria-hidden
+                          className={[
+                            "pointer-events-none absolute inset-0 flex items-center justify-center font-bold drop-shadow-md",
+                            "text-lg",
+                            cellIcon,
+                            "opacity-90",
+                          ].join(" ")}
+                        >
+                          ■
+                        </span>
+                      )}
+                      <span
+                        aria-hidden
+                        className="pointer-events-none absolute inset-0 rounded-lg bg-gradient-to-br from-teal-400/0 via-teal-400/[0.07] to-transparent opacity-0 transition-opacity duration-300 ease-out group-hover:opacity-100"
+                      />
+                    </button>
+                  );
+                })}
+              </div>
+            </div>
+          </div>
+
+          <div className="w-full flex flex-col gap-2">
+            <div className="text-center text-xs font-semibold tracking-[0.2em] uppercase text-slate-500">
+              Your board
+            </div>
+            <div
+              className="mx-auto w-full max-w-[min(92vw,420px)] rounded-2xl border border-white/10 bg-white/[0.04] p-4 sm:p-5 shadow-[inset_0_1px_0_rgba(255,255,255,0.05)]"
+              aria-hidden
+            >
+              <div
+                role="grid"
+                aria-label="Your battleship grid"
+                aria-disabled
+                className="mx-auto grid w-full max-w-[min(100%,360px)] grid-cols-6 gap-2 sm:gap-2 pointer-events-none"
+              >
+                {cells.map((i) => {
+                  const isShot = game.aiShots.has(i);
+                  const isHit = isShot && playerOccupiedCells.has(i);
+                  const isMiss = isShot && !isHit;
+                  const isOwnShip = playerOccupiedCells.has(i);
+                  const didJustFire = game.lastPlayerBoardCell === i && isShot;
+                  const isExploding = explodingCells.has(
+                    explosionKey("player", i),
+                  );
+                  const shipIdx = playerShipIndexByCell.get(i) ?? null;
+                  const sunkHullFragment = sunkPlayerHullByCell.get(i);
+
+                  const cellBase =
+                    "group relative aspect-square rounded-lg border transform-gpu transition-[background-color,border-color,box-shadow,transform,opacity,filter] duration-300 ease-out";
+
+                  const cellTone = isHit
+                    ? "border-rose-300/85 bg-gradient-to-br from-rose-500/62 via-rose-600/36 to-orange-700/28 shadow-[0_0_30px_rgba(244,63,94,0.52),inset_0_1px_0_rgba(255,255,255,0.14)]"
+                    : isMiss
+                      ? "border-slate-400/40 bg-slate-900/35 shadow-[0_2px_10px_rgba(15,23,42,0.26)]"
+                      : isOwnShip
+                        ? shipIdx === 0
+                          ? "border-teal-300/30 bg-teal-400/12 shadow-[0_0_22px_rgba(45,212,191,0.15),inset_0_1px_0_rgba(255,255,255,0.08)]"
+                          : "border-teal-300/25 bg-teal-400/10 shadow-[0_0_18px_rgba(45,212,191,0.12),inset_0_1px_0_rgba(255,255,255,0.06)]"
                         : "border-white/12 bg-white/[0.07] shadow-[inset_0_1px_0_rgba(255,255,255,0.06)]";
 
-                const cellHover =
-                  !isShot && !gameEnded
-                    ? "hover:-translate-y-px hover:bg-teal-400/12 hover:border-teal-300/35 hover:shadow-[0_0_20px_rgba(45,212,191,0.12)]"
+                  const shotDim =
+                    isShot && !didJustFire ? "opacity-[0.88]" : "";
+
+                  const cellClickAnim = didJustFire
+                    ? isHit
+                      ? "motion-reduce:animate-none animate-[hit-impact_0.48s_cubic-bezier(0.34,1.45,0.64,1)_forwards]"
+                      : "motion-reduce:animate-none animate-[miss-settle_0.45s_ease-out_forwards]"
                     : "";
 
-                const cellInteractivity =
-                  isShot || gameEnded
-                    ? "cursor-not-allowed"
-                    : "";
+                  const markAnim = isHit
+                    ? isExploding
+                      ? "motion-reduce:animate-none animate-[explosion-burst_0.3s_ease-out_forwards]"
+                      : didJustFire
+                        ? "motion-reduce:animate-none animate-[mark-hit_0.4s_cubic-bezier(0.34,1.45,0.64,1)_forwards]"
+                        : "transition-opacity duration-300 ease-out"
+                    : didJustFire
+                      ? "motion-reduce:animate-none animate-[mark-miss_0.45s_ease-out_forwards]"
+                      : "transition-opacity duration-300 ease-out";
 
-                const shotDim = isShot && !didJustClick ? "opacity-[0.88]" : "";
+                  const cellIcon =
+                    isHit
+                      ? "text-rose-50"
+                      : isOwnShip && !isShot
+                        ? "text-teal-50/70"
+                        : "text-slate-400/95";
 
-                const cellClickAnim = didJustClick
-                  ? isHit
-                    ? "motion-reduce:animate-none animate-[hit-impact_0.48s_cubic-bezier(0.34,1.45,0.64,1)_forwards]"
-                    : "motion-reduce:animate-none animate-[miss-settle_0.45s_ease-out_forwards]"
-                  : "";
-
-                const markAnim = isHit
-                  ? isExploding
-                    ? "motion-reduce:animate-none animate-[explosion-burst_0.3s_ease-out_forwards]"
-                    : didJustClick
-                      ? "motion-reduce:animate-none animate-[mark-hit_0.4s_cubic-bezier(0.34,1.45,0.64,1)_forwards]"
-                      : "transition-opacity duration-300 ease-out"
-                  : didJustClick
-                    ? "motion-reduce:animate-none animate-[mark-miss_0.45s_ease-out_forwards]"
-                    : "transition-opacity duration-300 ease-out";
-
-                const revealAnim = isShipRevealed
-                  ? "motion-reduce:animate-none animate-[ship-reveal_0.55s_ease-out_forwards]"
-                  : "";
-
-                const winAnim = isShipFound
-                  ? "motion-reduce:animate-none animate-[ship-win_0.85s_ease-out_forwards]"
-                  : "";
-
-                const cellIcon =
-                  isHit
-                    ? "text-rose-50"
-                    : isShipRevealed
-                      ? "text-teal-50/70"
-                      : "text-slate-400/95";
-
-                return (
-                  <button
-                    key={i}
-                    type="button"
-                    role="gridcell"
-                    aria-label={`Cell ${i + 1}${
-                      game.isLost && isShip && !isShot
-                        ? ", ship revealed"
-                        : game.isWon && isShip
-                          ? ", ship found"
-                          : isHit
-                            ? ", hit"
-                            : isMiss
-                              ? ", miss"
-                              : ""
-                    }`}
-                    disabled={isShot || gameEnded || isResetting}
-                    onClick={() => handleCellClick(i)}
-                    className={[
-                      cellBase,
-                      cellTone,
-                      cellHover,
-                      cellInteractivity,
-                      shotDim,
-                      cellClickAnim,
-                      revealAnim,
-                      winAnim,
-                    ].join(" ")}
-                  >
-                    {sunkHullFragment && (
-                      <ShipOutlineWatermark fragment={sunkHullFragment} />
-                    )}
-                    {isShot && (
-                      <span
-                        aria-hidden
-                        className={[
-                          "pointer-events-none absolute inset-0 z-[2] flex items-center justify-center font-bold",
-                          isHit && isExploding
-                            ? "text-amber-100 drop-shadow-[0_0_16px_rgba(251,191,36,0.95),0_0_32px_rgba(248,113,113,0.55),0_0_48px_rgba(251,146,60,0.35)]"
-                            : isHit
-                              ? `text-2xl drop-shadow-md ${cellIcon}`
-                              : "text-lg font-semibold text-slate-400/95 drop-shadow-md",
-                          markAnim,
-                        ].join(" ")}
-                      >
-                        {isHit ? (isExploding ? <ExplosionIcon /> : "✕") : "○"}
-                      </span>
-                    )}
-                    {!isShot && isShipRevealed && (
-                      <span
-                        aria-hidden
-                        className={[
-                          "pointer-events-none absolute inset-0 flex items-center justify-center font-bold drop-shadow-md",
-                          "text-lg",
-                          cellIcon,
-                          "opacity-90",
-                        ].join(" ")}
-                      >
-                        ■
-                      </span>
-                    )}
-                    <span
-                      aria-hidden
-                      className="pointer-events-none absolute inset-0 rounded-lg bg-gradient-to-br from-teal-400/0 via-teal-400/[0.07] to-transparent opacity-0 transition-opacity duration-300 ease-out group-hover:opacity-100"
-                    />
-                  </button>
-                );
-              })}
+                  return (
+                    <div
+                      key={`p-${i}`}
+                      role="gridcell"
+                      aria-label={`Your cell ${i + 1}${
+                        isHit ? ", hit" : isMiss ? ", miss" : isOwnShip ? ", your ship" : ""
+                      }`}
+                      className={[
+                        cellBase,
+                        cellTone,
+                        shotDim,
+                        cellClickAnim,
+                      ].join(" ")}
+                    >
+                      {sunkHullFragment && (
+                        <ShipOutlineWatermark fragment={sunkHullFragment} />
+                      )}
+                      {isShot && (
+                        <span
+                          aria-hidden
+                          className={[
+                            "pointer-events-none absolute inset-0 z-[2] flex items-center justify-center font-bold",
+                            isHit && isExploding
+                              ? "text-amber-100 drop-shadow-[0_0_16px_rgba(251,191,36,0.95),0_0_32px_rgba(248,113,113,0.55),0_0_48px_rgba(251,146,60,0.35)]"
+                              : isHit
+                                ? `text-2xl drop-shadow-md ${cellIcon}`
+                                : "text-lg font-semibold text-slate-400/95 drop-shadow-md",
+                            markAnim,
+                          ].join(" ")}
+                        >
+                          {isHit ? (isExploding ? <ExplosionIcon /> : "✕") : "○"}
+                        </span>
+                      )}
+                      {!isShot && isOwnShip && (
+                        <span
+                          aria-hidden
+                          className={[
+                            "pointer-events-none absolute inset-0 flex items-center justify-center font-bold drop-shadow-md text-lg opacity-80",
+                            cellIcon,
+                          ].join(" ")}
+                        >
+                          ■
+                        </span>
+                      )}
+                    </div>
+                  );
+                })}
+              </div>
             </div>
           </div>
         </div>
@@ -1433,22 +2069,6 @@ export default function Home() {
           >
             {isResetting ? "Starting new game…" : "Reset"}
           </button>
-          {gameEnded && (
-            <button
-              type="button"
-              onClick={handlePlayAgain}
-              disabled={isResetting}
-              aria-busy={isResetting}
-              className={[
-                "rounded-xl border border-white/15 bg-white/[0.06] px-5 py-2.5 text-xs font-semibold text-slate-200 transition-[background-color,border-color,box-shadow,transform,opacity] duration-200 ease-out focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-teal-400/50",
-                isResetting
-                  ? "cursor-wait opacity-70"
-                  : "hover:border-white/25 hover:bg-white/[0.1] hover:shadow-[0_0_20px_rgba(255,255,255,0.06)] active:scale-[0.98]",
-              ].join(" ")}
-            >
-              {isResetting ? "Starting new game…" : "Play again"}
-            </button>
-          )}
           <button
             type="button"
             onClick={handleBackToDifficulty}
