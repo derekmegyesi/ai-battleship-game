@@ -466,14 +466,69 @@ export function pickRandomUnshotCell(shots: Set<number>): number {
 
 export type AiTargetingMode = "hunt" | "target";
 
+/** Orthogonal step on the grid: exactly one of dr, dc is ±1 and the other is 0. */
+export type AiLineDirection = { dr: number; dc: number };
+
 /** Opponent AI: checkerboard hunt + FIFO target queue after hits. */
 export type AiHuntTargetBrain = {
   mode: AiTargetingMode;
   pendingTargets: number[];
+  /** Last committed hit on the player board during this chase (cleared when returning to hunt or on sink). */
+  lastHitCell: number | null;
+  /** After two adjacent hits, only cells on this axis stay queued; extensions go forward then backward along the line. */
+  lineDirection: AiLineDirection | null;
 };
 
 export function createAiHuntTargetBrain(): AiHuntTargetBrain {
-  return { mode: "hunt", pendingTargets: [] };
+  return {
+    mode: "hunt",
+    pendingTargets: [],
+    lastHitCell: null,
+    lineDirection: null,
+  };
+}
+
+function clearAiTargetLine(brain: AiHuntTargetBrain): void {
+  brain.lastHitCell = null;
+  brain.lineDirection = null;
+}
+
+function orthoAdjacentCells(a: number, b: number): boolean {
+  const A = cellRowCol(a);
+  const B = cellRowCol(b);
+  return Math.abs(A.row - B.row) + Math.abs(A.col - B.col) === 1;
+}
+
+function directionFromTo(fromCell: number, toCell: number): AiLineDirection | null {
+  if (!orthoAdjacentCells(fromCell, toCell)) return null;
+  const A = cellRowCol(fromCell);
+  const B = cellRowCol(toCell);
+  return { dr: Math.sign(B.row - A.row), dc: Math.sign(B.col - A.col) };
+}
+
+function cellOnOrthoLine(hitCell: number, dir: AiLineDirection, c: number): boolean {
+  const H = cellRowCol(hitCell);
+  const C = cellRowCol(c);
+  if (dir.dc === 0 && dir.dr !== 0) return C.col === H.col;
+  if (dir.dr === 0 && dir.dc !== 0) return C.row === H.row;
+  return false;
+}
+
+function enqueueAlongLockedLine(
+  brain: AiHuntTargetBrain,
+  cell: number,
+  dir: AiLineDirection,
+  aiShotsAfter: Set<number>,
+): void {
+  const forward = cell + dir.dr * BOARD_SIZE + dir.dc;
+  const backward = cell - dir.dr * BOARD_SIZE - dir.dc;
+  for (const n of [forward, backward]) {
+    if (n < 0 || n >= TOTAL_CELLS) continue;
+    if (!orthoAdjacentCells(cell, n)) continue;
+    if (aiShotsAfter.has(n)) continue;
+    if (brain.pendingTargets.includes(n)) continue;
+    brain.pendingTargets.push(n);
+  }
 }
 
 function orthogonalNeighborCells(cell: number): number[] {
@@ -507,6 +562,7 @@ export function pickHuntTargetAiCell(
 
   brain.pendingTargets = [];
   brain.mode = "hunt";
+  clearAiTargetLine(brain);
 
   const evenParity: number[] = [];
   const oddParity: number[] = [];
@@ -524,23 +580,50 @@ export function pickHuntTargetAiCell(
 }
 
 /**
- * After a committed AI shot: on hit, switch to target and enqueue orthogonal neighbors
- * (in bounds, not already shot, no duplicate queue entries). On miss, return to hunt if the queue is empty.
+ * After a committed AI shot: on hit, switch to target and enqueue neighbors (all four until
+ * two adjacent hits lock an axis, then only that line — forward along the hit streak first).
+ * On sink, clears the chase and returns to hunt. On miss, return to hunt if the queue is empty.
  */
 export function registerAiShotResult(
   brain: AiHuntTargetBrain,
   cell: number,
   hit: boolean,
   aiShotsAfter: Set<number>,
+  opts?: { sunk?: boolean },
 ): void {
+  if (hit && opts?.sunk) {
+    brain.mode = "hunt";
+    brain.pendingTargets = [];
+    clearAiTargetLine(brain);
+    return;
+  }
+
   if (hit) {
     brain.mode = "target";
-    for (const n of orthogonalNeighborCells(cell)) {
-      if (aiShotsAfter.has(n)) continue;
-      if (brain.pendingTargets.includes(n)) continue;
-      brain.pendingTargets.push(n);
+    const prevHit = brain.lastHitCell;
+    if (prevHit !== null && orthoAdjacentCells(prevHit, cell)) {
+      const dir = directionFromTo(prevHit, cell);
+      if (dir) brain.lineDirection = dir;
+    } else {
+      brain.lineDirection = null;
     }
+
+    if (brain.lineDirection) {
+      const dir = brain.lineDirection;
+      brain.pendingTargets = brain.pendingTargets.filter(
+        (c) => !aiShotsAfter.has(c) && cellOnOrthoLine(cell, dir, c),
+      );
+      enqueueAlongLockedLine(brain, cell, dir, aiShotsAfter);
+    } else {
+      for (const n of orthogonalNeighborCells(cell)) {
+        if (aiShotsAfter.has(n)) continue;
+        if (brain.pendingTargets.includes(n)) continue;
+        brain.pendingTargets.push(n);
+      }
+    }
+    brain.lastHitCell = cell;
   } else if (brain.pendingTargets.length === 0) {
     brain.mode = "hunt";
+    clearAiTargetLine(brain);
   }
 }

@@ -641,6 +641,10 @@ export default function Home() {
         const brainSnap = {
           mode: aiBrainRef.current.mode,
           pendingTargets: [...aiBrainRef.current.pendingTargets],
+          lastHitCell: aiBrainRef.current.lastHitCell,
+          lineDirection: aiBrainRef.current.lineDirection
+            ? { ...aiBrainRef.current.lineDirection }
+            : null,
         };
         const cell = pickHuntTargetAiCell(prev.aiShots, brainSnap);
         const willHit = prev.playerShips.some((s) => s.positions.includes(cell));
@@ -657,9 +661,17 @@ export default function Home() {
           }
           aiBrainRef.current.mode = brainSnap.mode;
           aiBrainRef.current.pendingTargets = brainSnap.pendingTargets;
+          aiBrainRef.current.lastHitCell = brainSnap.lastHitCell;
+          aiBrainRef.current.lineDirection = brainSnap.lineDirection
+            ? { ...brainSnap.lineDirection }
+            : null;
           const aiShotsAfter = new Set(p.aiShots);
           aiShotsAfter.add(cell);
-          registerAiShotResult(aiBrainRef.current, cell, willHit, aiShotsAfter);
+          const sunk =
+            willHit && isSinkingHitForCell(p.playerShips, cell);
+          registerAiShotResult(aiBrainRef.current, cell, willHit, aiShotsAfter, {
+            sunk,
+          });
           setGame(applyAiFire(p, cell));
         };
         if (willHit) {

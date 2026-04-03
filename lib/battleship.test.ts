@@ -61,17 +61,52 @@ describe("assertShipCellsAreStraightLineNoWrap", () => {
     expect(() => assertShipCellsAreStraightLineNoWrap([0, 10, 20])).not.toThrow();
   });
 
-  it("rejects row wrap (last col to first col same row)", () => {
-    expect(() => assertShipCellsAreStraightLineNoWrap([9, 10])).toThrow();
-  });
-
-  it("rejects diagonal polyline", () => {
-    expect(() => assertShipCellsAreStraightLineNoWrap([0, 11])).toThrow();
-  });
-
   it("rejects out of bounds", () => {
     expect(() => assertShipCellsAreStraightLineNoWrap([-1])).toThrow();
     expect(() => assertShipCellsAreStraightLineNoWrap([TOTAL_CELLS])).toThrow();
+  });
+
+  it("rejects same-column leap from top row to bottom row (every column)", () => {
+    for (let col = 0; col < BOARD_SIZE; col++) {
+      const top = col;
+      const bottom = (BOARD_SIZE - 1) * BOARD_SIZE + col;
+      expect(() => assertShipCellsAreStraightLineNoWrap([top, bottom])).toThrow(/no edge wrap/);
+    }
+  });
+
+  it("rejects wrap at north-west corner (index 0)", () => {
+    // Row 0: cannot span col 0 to col 9 without intermediate cells.
+    expect(() => assertShipCellsAreStraightLineNoWrap([0, 9])).toThrow(/no edge wrap/);
+  });
+
+  it("rejects wrap at north-east corner (index 9)", () => {
+    // Linear index +1 crosses into the next row (not a horizontal continuation on row 0).
+    expect(() => assertShipCellsAreStraightLineNoWrap([9, 10])).toThrow(/Invalid ship/);
+  });
+
+  it("rejects wrap at south-west corner (index 90)", () => {
+    // Row 9: cannot span col 0 to col 9 without intermediate cells.
+    expect(() => assertShipCellsAreStraightLineNoWrap([90, 99])).toThrow(/no edge wrap/);
+  });
+
+  it("rejects wrap at south-east corner (index 99)", () => {
+    // Row 9: gap before the corner (missing col 8).
+    expect(() => assertShipCellsAreStraightLineNoWrap([97, 99])).toThrow(/no edge wrap/);
+    // Column 9: gap below row 6 (missing rows 7–8 on that column).
+    expect(() => assertShipCellsAreStraightLineNoWrap([69, 99])).toThrow(/no edge wrap/);
+  });
+
+  it("rejects diagonal ships (not axis-aligned)", () => {
+    const diagonalMsg = /straight horizontal or vertical|diagonal/;
+    // Bishop-adjacent pairs (different row and column).
+    expect(() => assertShipCellsAreStraightLineNoWrap([0, 11])).toThrow(diagonalMsg);
+    expect(() => assertShipCellsAreStraightLineNoWrap([10, 21])).toThrow(diagonalMsg);
+    expect(() => assertShipCellsAreStraightLineNoWrap([9, 18])).toThrow(diagonalMsg);
+    expect(() => assertShipCellsAreStraightLineNoWrap([90, 81])).toThrow(diagonalMsg);
+    // Opposite corners: not a horizontal or vertical segment.
+    expect(() => assertShipCellsAreStraightLineNoWrap([0, 99])).toThrow(diagonalMsg);
+    // Three cells stepping down-diagonal in row/col.
+    expect(() => assertShipCellsAreStraightLineNoWrap([0, 11, 22])).toThrow(diagonalMsg);
   });
 });
 
@@ -100,6 +135,17 @@ describe("assertValidFleetLayout", () => {
 
   it("rejects wrong ship count", () => {
     expect(() => assertValidFleetLayout([[0, 1]])).toThrow();
+  });
+
+  it("rejects ships that skip cells (no bottom-row or column wrap)", () => {
+    const fleet = [
+      [0, 1, 2, 3, 4],
+      [60, 61, 62, 63],
+      [20, 21, 22],
+      [40, 41, 42],
+      [90, 99],
+    ];
+    expect(() => assertValidFleetLayout(fleet)).toThrow(/no edge wrap/);
   });
 });
 
@@ -217,6 +263,8 @@ describe("createAiHuntTargetBrain", () => {
     const b = createAiHuntTargetBrain();
     expect(b.mode).toBe("hunt");
     expect(b.pendingTargets).toEqual([]);
+    expect(b.lastHitCell).toBe(null);
+    expect(b.lineDirection).toBe(null);
   });
 });
 
@@ -312,11 +360,125 @@ describe("pickHuntTargetAiCell / registerAiShotResult", () => {
     expect(shots.has(second)).toBe(false);
   });
 
+  it("after two collinear hits, drops perpendicular queue and extends along the line first", () => {
+    const brain = createAiHuntTargetBrain();
+    registerAiShotResult(brain, 0, true, new Set([0]));
+    expect(brain.lineDirection).toBe(null);
+    expect(brain.pendingTargets).toContain(10);
+    expect(brain.pendingTargets).toContain(1);
+
+    registerAiShotResult(brain, 10, true, new Set([0, 10]));
+    expect(brain.lineDirection).toEqual({ dr: 1, dc: 0 });
+    expect(brain.pendingTargets).not.toContain(1);
+    expect(brain.pendingTargets[0]).toBe(20);
+  });
+
+  it("line lock at bottom edge: never enqueues forward off-board; still probes north along column", () => {
+    const brain = createAiHuntTargetBrain();
+    registerAiShotResult(brain, 89, true, new Set([89]));
+    registerAiShotResult(brain, 99, true, new Set([89, 99]));
+    expect(brain.lineDirection).toEqual({ dr: 1, dc: 0 });
+    expect(brain.pendingTargets).toEqual([79]);
+    expect(brain.pendingTargets.every((c) => c >= 0 && c < TOTAL_CELLS)).toBe(true);
+    expect(brain.lastHitCell).toBe(99);
+    expect(brain.mode).toBe("target");
+  });
+
+  it("line lock at top edge: never enqueues forward off-board; still probes south along column", () => {
+    const brain = createAiHuntTargetBrain();
+    registerAiShotResult(brain, 10, true, new Set([10]));
+    registerAiShotResult(brain, 0, true, new Set([10, 0]));
+    expect(brain.lineDirection).toEqual({ dr: -1, dc: 0 });
+    expect(brain.pendingTargets).toEqual([20]);
+    expect(brain.lastHitCell).toBe(0);
+  });
+
+  it("line lock at east edge: never enqueues forward off-board; still probes west along row", () => {
+    const brain = createAiHuntTargetBrain();
+    registerAiShotResult(brain, 98, true, new Set([98]));
+    registerAiShotResult(brain, 99, true, new Set([98, 99]));
+    expect(brain.lineDirection).toEqual({ dr: 0, dc: 1 });
+    expect(brain.pendingTargets).toEqual([97]);
+    expect(brain.lastHitCell).toBe(99);
+  });
+
+  it("line lock at west edge (col 0): does not wrap to previous row; only true row neighbors enqueue", () => {
+    const brain = createAiHuntTargetBrain();
+    registerAiShotResult(brain, 11, true, new Set([11]));
+    registerAiShotResult(brain, 10, true, new Set([11, 10]));
+    expect(brain.lineDirection).toEqual({ dr: 0, dc: -1 });
+    expect(brain.pendingTargets).toEqual([12]);
+    expect(
+      brain.pendingTargets.every((c) => cellRowCol(c).row === 1),
+    ).toBe(true);
+  });
+
+  it("sunk hit clears target queue, line lock, and returns to hunt", () => {
+    const brain = createAiHuntTargetBrain();
+    registerAiShotResult(brain, 0, true, new Set([0]));
+    registerAiShotResult(brain, 10, true, new Set([0, 10]));
+    expect(brain.lineDirection).not.toBe(null);
+    expect(brain.pendingTargets.length).toBeGreaterThan(0);
+    registerAiShotResult(brain, 20, true, new Set([0, 10, 20]), { sunk: true });
+    expect(brain.mode).toBe("hunt");
+    expect(brain.pendingTargets).toEqual([]);
+    expect(brain.lastHitCell).toBe(null);
+    expect(brain.lineDirection).toBe(null);
+  });
+
+  it("hit not orthogonally adjacent to lastHitCell clears line lock and enqueues new hit neighbors", () => {
+    const brain = createAiHuntTargetBrain();
+    registerAiShotResult(brain, 0, true, new Set([0]));
+    registerAiShotResult(brain, 50, true, new Set([0, 50]));
+    expect(brain.lineDirection).toBe(null);
+    expect(brain.lastHitCell).toBe(50);
+    // Cell 50 is row 5 col 0: orthogonal neighbors 40, 60, 51 (west is out of bounds).
+    expect(brain.pendingTargets).toEqual(
+      expect.arrayContaining([40, 51, 60]),
+    );
+  });
+
+  it("exhausting target queue via pick then falling through clears line state for hunt", () => {
+    const brain: ReturnType<typeof createAiHuntTargetBrain> = {
+      mode: "target",
+      pendingTargets: [7],
+      lastHitCell: 0,
+      lineDirection: { dr: 1, dc: 0 },
+    };
+    const shots = new Set<number>();
+    expect(pickHuntTargetAiCell(shots, brain)).toBe(7);
+    expect(brain.mode).toBe("target");
+    expect(brain.pendingTargets).toEqual([]);
+    shots.add(7);
+    pickHuntTargetAiCell(shots, brain);
+    expect(brain.mode).toBe("hunt");
+    expect(brain.lastHitCell).toBe(null);
+    expect(brain.lineDirection).toBe(null);
+  });
+
+  it("miss draining last target clears line state, not only mode", () => {
+    const shots = new Set<number>();
+    const brain: ReturnType<typeof createAiHuntTargetBrain> = {
+      mode: "target",
+      pendingTargets: [5],
+      lastHitCell: 22,
+      lineDirection: { dr: 0, dc: 1 },
+    };
+    expect(pickHuntTargetAiCell(shots, brain)).toBe(5);
+    shots.add(5);
+    registerAiShotResult(brain, 5, false, shots);
+    expect(brain.mode).toBe("hunt");
+    expect(brain.lastHitCell).toBe(null);
+    expect(brain.lineDirection).toBe(null);
+  });
+
   it("returns to hunt when target queue is empty after a miss", () => {
     const shots = new Set<number>();
     const brain: ReturnType<typeof createAiHuntTargetBrain> = {
       mode: "target",
       pendingTargets: [5],
+      lastHitCell: null,
+      lineDirection: null,
     };
     const cell = pickHuntTargetAiCell(shots, brain);
     expect(cell).toBe(5);
@@ -331,6 +493,8 @@ describe("pickHuntTargetAiCell / registerAiShotResult", () => {
     const brain: ReturnType<typeof createAiHuntTargetBrain> = {
       mode: "target",
       pendingTargets: [5, 11],
+      lastHitCell: null,
+      lineDirection: null,
     };
     const cell = pickHuntTargetAiCell(shots, brain);
     expect(cell).toBe(11);
@@ -363,6 +527,8 @@ describe("pickHuntTargetAiCell / registerAiShotResult", () => {
     const brain: ReturnType<typeof createAiHuntTargetBrain> = {
       mode: "target",
       pendingTargets: [20, 30],
+      lastHitCell: null,
+      lineDirection: null,
     };
     registerAiShotResult(brain, 99, false, new Set([99]));
     expect(brain.mode).toBe("target");
