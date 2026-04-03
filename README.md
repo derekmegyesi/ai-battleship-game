@@ -1,103 +1,170 @@
 # Battleship: Solo Tactical
+# AI Battleship Game
+
 <p align="center">
-  <img src="./gameplay.gif" alt="Battleship gameplay demo" width="600"/>
+  <strong>A modern implementation of Battleship with a state-driven architecture and heuristic AI opponent.</strong>
 </p>
 
-A modern, single-player Battleship experience focused on fast gameplay, clear feedback loops, and a foundation for AI-driven system evolution.
+<p align="center">
+  <img src="./images/menu_screen.gif" width="500"/>
+</p>
+
+<p align="center">
+  Turn-based gameplay · Dual-board system · Heuristic AI · Unit-tested core logic
+</p>
+
+## Screenshots
+
+<table>
+  <tr>
+      <td align="center">
+      <img src="./images/opponent_board.gif" width="500"/><br/>
+      <sub>AI Turn</sub>
+    </td>
+    <td align="center">
+      <img src="./images/player_board.gif" width="500"/><br/>
+      <sub>Player Board</sub>
+    </td>
+  </tr>
+</table>
 
 ---
 
 ## Overview
 
-This project started as a simple question:
+This application implements a complete Battleship experience with both player and AI-controlled gameplay. The system is designed around clear state transitions and deterministic game logic, ensuring predictable and maintainable behavior.
 
-What does a well-scoped, polished game look like when built using AI-assisted development tools?
-
-Rather than overbuilding, I focused on a tight core:
-- small grid
-- simple rules
-- strong visual feedback
-- fast iteration
-
-The result is a replayable game that emphasizes decision-making under constraints.
+Key capabilities include:
+- Full game loop: setup → turn-based gameplay → game over
+- Dual-board system separating player and opponent state
+- Classic 10×10 grid with standard ship configuration
+- Heuristic AI opponent with adaptive behavior
+- Lightweight UI enhancements to improve usability and clarity
+- Unit-tested core logic for reliability and correctness
 
 ---
 
-## Gameplay
+## Core Gameplay
 
-- 6x6 grid
-- Two hidden ships (length 3 and 2)
-- Limited number of shots per game
-- Immediate feedback on each move (hit or miss)
-- Win and loss conditions
-- Reset to replay
-
-The shot limit introduces tension and forces more deliberate play, moving the experience beyond simple exploration.
-
----
-
-## Product Approach
-
-The initial version was a deterministic system where the user would eventually win.
-
-To improve engagement, I introduced:
-- constraints (limited shots)
-- clear feedback loops
-- a tighter interaction model
-
-This shifts the experience toward:
-> making informed decisions rather than randomly clicking
-
-The scope was intentionally constrained to ensure a complete, polished experience before adding complexity.
+- 10×10 grid based on the standard Battleship format
+- Five ships per side:
+  - Carrier (5)
+  - Battleship (4)
+  - Cruiser (3)
+  - Submarine (3)
+  - Destroyer (2)
+- Randomized ship placement for both player and AI
+- Alternating turn-based gameplay
+- Hit and miss tracking on both boards
+- Ships track individual damage and are considered sunk when all positions are hit
+- Game ends when all ships in a fleet are destroyed
 
 ---
 
-## System Evolution
+## AI Opponent
 
-This project is designed to evolve incrementally.
+The AI uses a simple but effective heuristic strategy based on two modes:
 
-Planned extensions include:
-- pattern-based ship placement (beyond pure randomness)
-- difficulty modes
-- adaptive behavior based on player performance
-- AI-assisted feedback and strategy hints
+### Hunt Mode
+- Selects moves using a checkerboard-style pattern
+- Maximizes coverage efficiency while minimizing redundant guesses
 
-Longer term, the goal is to explore agent-based systems that influence gameplay and difficulty.
+### Target Mode
+- Triggered after a successful hit
+- Queues adjacent cells and prioritizes them in subsequent moves
+- Focuses on completing ship destruction before returning to hunt mode
+
+Additional constraints:
+- Prevents duplicate moves
+- Respects board boundaries
+- Uses a deterministic and explainable decision process
+
+---
+
+## System Design
+
+The system is built around a state-driven architecture:
+
+setup → playerTurn → aiTurn → gameOver
+
+Key design elements:
+- Separation of concerns between player and AI boards
+- Independent tracking of player and AI ship states
+- Centralized game state management
+- Deterministic win condition based on fleet destruction
+- Turn orchestration ensuring strict alternation between player and AI
+
+---
+
+## Testing
+
+Core game logic is covered by unit tests to ensure correctness and stability.
+
+Tested areas include:
+- Ship placement validation (bounds and overlap)
+- Attack resolution (hit, miss, ship damage tracking)
+- Win condition detection
+- AI decision constraints (no duplicate moves, valid targeting)
+
+Run tests:
+
+`npm test`
+
+---
+
+## User Experience
+
+The interface focuses on clarity and responsiveness without over-engineering:
+
+- Visual distinction between player and opponent boards
+- Turn indicators ("Your Turn" and "AI Thinking")
+- Modal with gameplay instructions
+- Hit and miss feedback with visual indicators
+- Subtle visual enhancements (e.g., board tilt) to improve perceived quality
+- Scaled grid layout to support 10×10 gameplay without clutter
 
 ---
 
 ## Tech Stack
 
-- Next.js (React)
-- Tailwind CSS
-- Cursor (AI-assisted development)
-- Claude (reasoning and system design support)
+- Frontend: React (or equivalent framework)
+- Language: TypeScript / JavaScript
+- Styling: CSS
+- AI Logic: Custom heuristic implementation (no external libraries)
 
 ---
 
-## Development Approach
+## Getting Started
 
-This project was built using an AI-assisted workflow:
+Install dependencies:
 
-- Cursor was used to generate and iterate on code
-- Changes were applied incrementally (UI → logic → refinement)
-- Claude was used selectively to reason through logic and structure
+`npm install`
 
-The focus was on maintaining control of the system while using AI to accelerate execution.
+Run the development server:
 
----
+`npm run dev`
 
-## Next Steps
+Open in your browser:
 
-- Introduce difficulty levels
-- Improve ship placement logic
-- Add lightweight AI-driven feedback
-- Continue refining interaction and visual polish
+`http://localhost (port will auto set)`
 
 ---
 
-## Running Locally
+## Key Learnings
 
-```bash
-npm install
-npm run dev
+- Designing state-driven systems for interactive applications
+- Implementing AI behavior using simple, explainable heuristics
+- Managing synchronized state across dual game boards
+- Structuring applications to balance clarity, extensibility, and simplicity
+- Writing unit tests to validate core system behavior
+- Using AI-assisted development tools (e.g., Cursor) effectively for iterative building
+
+---
+
+## Future Improvements
+
+- Multiplayer support (real-time or asynchronous)
+- Persistent leaderboard and player statistics
+- Configurable difficulty levels with more advanced AI strategies
+- Enhanced audio and animation feedback
+- Mobile responsiveness and touch optimization
