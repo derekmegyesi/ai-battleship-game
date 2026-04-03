@@ -10,19 +10,38 @@ import {
 } from "react";
 import { flushSync } from "react-dom";
 
-const BOARD_SIZE = 6;
-const TOTAL_CELLS = BOARD_SIZE * BOARD_SIZE;
-/** After this many consecutive misses without a hit, show a subtle tip until the next hit. */
-const CONSECUTIVE_MISS_HINT_AFTER = 3;
+import {
+  applyAiFire,
+  applyPlayerFire,
+  assistantTipForGame,
+  type BattleGameState,
+  CONSECUTIVE_MISS_HINT_AFTER,
+  createAiHuntTargetBrain,
+  createBattleState,
+  type Difficulty,
+  DIFFICULTY_LABELS,
+  fleetOccupiedCells,
+  isSinkingHitForCell,
+  mirroredCurrentTurn,
+  pickHuntTargetAiCell,
+  placePlayerShips,
+  registerAiShotResult,
+  TOTAL_CELLS,
+} from "@/lib/battleship";
+
 /** How long we keep the explosion icon visible before revealing the hit mark. */
 const EXPLOSION_MS = 300;
 /** Fade-out duration before applying a new game (also acts as a short intentional delay). */
 const RESET_FADE_OUT_MS = 360;
 const RESET_CONFIRM_MESSAGE =
   "Start a new game? Your current board and shots will be cleared.";
+const STOP_CONFIRM_MESSAGE =
+  "Stop this game? All boards will be cleared.";
+const BACK_TO_DIFFICULTY_CONFIRM_MESSAGE =
+  "Return to difficulty selection? Your current game will be discarded.";
 
 /** Silence after any `public/audio` clip ends (ms). */
-const PUBLIC_AUDIO_POST_GAP_MS = 500;
+const PUBLIC_AUDIO_POST_GAP_MS = 150;
 
 const PLAYERS_TURN_AUDIO_SRC = "/audio/players_turn.mp3";
 const OPPONENTS_TURN_AUDIO_SRC = "/audio/opponents_turn.mp3";
@@ -239,92 +258,6 @@ function emitStatsStoreChange() {
 
 const SERVER_STATS_SNAPSHOT: PersistedStats = { wins: 0, bestShots: null };
 
-/** Lengths of ships on the board. Each board cell may belong to at most one ship. */
-const SHIP_LENGTHS = [3, 2] as const;
-const EXPECTED_SHIP_CELL_COUNT = SHIP_LENGTHS.reduce((a, b) => a + b, 0);
-
-/** Hard rule: no cell index may appear on more than one ship. */
-function assertNoSharedShipCells(
-  firstShip: readonly number[],
-  secondShip: readonly number[],
-): void {
-  const occupiedByFirst = new Set(firstShip);
-  for (const cell of secondShip) {
-    if (occupiedByFirst.has(cell)) {
-      throw new Error(
-        `Invalid ship layout: cell ${cell} would be occupied by more than one ship.`,
-      );
-    }
-  }
-}
-
-function assertEveryCellBelongsToAtMostOneShip(shipCells: Set<number>): void {
-  if (shipCells.size !== EXPECTED_SHIP_CELL_COUNT) {
-    throw new Error(
-      `Invalid ship layout: need ${EXPECTED_SHIP_CELL_COUNT} distinct cells (no shared cells); got ${shipCells.size}.`,
-    );
-  }
-}
-
-function combineShipPlacements(ship3: number[], ship2: number[]): Set<number> {
-  assertNoSharedShipCells(ship3, ship2);
-  const cells = new Set([...ship3, ...ship2]);
-  assertEveryCellBelongsToAtMostOneShip(cells);
-  return cells;
-}
-
-type OutcomeTone = "ready" | "miss" | "hit" | "sunk" | "lost";
-
-type Difficulty = "easy" | "medium" | "hard";
-
-const DIFFICULTY_LABELS: Record<Difficulty, string> = {
-  easy: "Easy",
-  medium: "Medium",
-  hard: "Hard",
-};
-
-type GameLoopPhase = "setup" | "playerTurn" | "aiTurn" | "gameOver";
-
-/** Whose firing turn it is; always derived from `gamePhase` (and `winner` when `gameOver`). */
-function mirroredCurrentTurn(
-  gamePhase: GameLoopPhase,
-  winner: "player" | "ai" | null,
-): "player" | "ai" {
-  if (gamePhase === "setup" || gamePhase === "playerTurn") return "player";
-  if (gamePhase === "aiTurn") return "ai";
-  return winner === "ai" ? "ai" : "player";
-}
-
-type ShipModel = {
-  positions: readonly number[];
-  hits: number;
-  size: number;
-};
-
-type BattleGameState = {
-  /** Bumps on each new deal; used to apply win stats exactly once per game. */
-  dealId: number;
-  difficulty: Difficulty;
-  gamePhase: GameLoopPhase;
-  /** Mirrored from `gamePhase` (and `winner` when `gamePhase === "gameOver"`). */
-  currentTurn: "player" | "ai";
-  playerShips: ShipModel[];
-  aiShips: ShipModel[];
-  /** Shots the player fired at the AI board (cell indices). */
-  playerShots: Set<number>;
-  /** Shots the AI fired at the player board (cell indices). */
-  aiShots: Set<number>;
-  status: string;
-  /** Resets to 0 on any player hit on the opponent board; used for optional miss-streak hints. */
-  consecutiveMisses: number;
-  lastOpponentBoardCell: number | null;
-  lastPlayerBoardCell: number | null;
-  lastOutcome: OutcomeTone;
-  winner: "player" | "ai" | null;
-  /** After the turn clip finishes plus post-gap, player may shoot. */
-  playerFireEnabled: boolean;
-};
-
 const EXPLOSION_MAIN_DEGS = [0, 45, 90, 135, 180, 225, 270, 315] as const;
 const EXPLOSION_MID_DEGS = [22.5, 67.5, 112.5, 157.5, 202.5, 247.5, 292.5, 337.5] as const;
 
@@ -398,427 +331,6 @@ function ExplosionIcon() {
       />
     </svg>
   );
-}
-
-function randPick<T>(arr: T[]): T {
-  return arr[Math.floor(Math.random() * arr.length)];
-}
-
-function cellRowCol(cell: number): { row: number; col: number } {
-  return { row: Math.floor(cell / BOARD_SIZE), col: cell % BOARD_SIZE };
-}
-
-function minManhattanBetweenShips(a: readonly number[], b: readonly number[]): number {
-  let min = Infinity;
-  for (const ca of a) {
-    const { row: ra, col: ca_ } = cellRowCol(ca);
-    for (const cb of b) {
-      const { row: rb, col: cb_ } = cellRowCol(cb);
-      const d = Math.abs(ra - rb) + Math.abs(ca_ - cb_);
-      if (d < min) min = d;
-    }
-  }
-  return min;
-}
-
-function edgeCellCount(ship: readonly number[]): number {
-  let n = 0;
-  for (const c of ship) {
-    const { row, col } = cellRowCol(c);
-    if (row === 0 || row === BOARD_SIZE - 1 || col === 0 || col === BOARD_SIZE - 1) {
-      n += 1;
-    }
-  }
-  return n;
-}
-
-/** Cells that lie on a board corner (used to bias “along the rim” layouts). */
-function cornerTouchCount(ship: readonly number[]): number {
-  let n = 0;
-  const last = BOARD_SIZE - 1;
-  for (const c of ship) {
-    const { row, col } = cellRowCol(c);
-    if (
-      (row === 0 || row === last) &&
-      (col === 0 || col === last)
-    ) {
-      n += 1;
-    }
-  }
-  return n;
-}
-
-/**
- * Each new deal picks a placement “doctrine” so layouts vary: sometimes tight groups,
- * sometimes rim-hugging, sometimes interior spread — not one static recipe per difficulty.
- */
-type PlacementDoctrine =
-  | "scatter"
-  | "fleet_cluster"
-  | "perimeter"
-  | "open_water"
-  | "tactical";
-
-function rollPlacementDoctrine(difficulty: Difficulty): PlacementDoctrine {
-  const r = Math.random();
-  if (difficulty === "easy") {
-    if (r < 0.26) return "scatter";
-    if (r < 0.5) return "fleet_cluster";
-    if (r < 0.74) return "perimeter";
-    return "open_water";
-  }
-  if (difficulty === "medium") {
-    if (r < 0.11) return "scatter";
-    if (r < 0.34) return "fleet_cluster";
-    if (r < 0.57) return "perimeter";
-    if (r < 0.78) return "open_water";
-    return "tactical";
-  }
-  if (r < 0.05) return "scatter";
-  if (r < 0.23) return "fleet_cluster";
-  if (r < 0.45) return "perimeter";
-  if (r < 0.66) return "open_water";
-  return "tactical";
-}
-
-function pairWeightForDoctrine(
-  ships: number[][],
-  doctrine: PlacementDoctrine,
-): number {
-  const s3 = ships[0]!;
-  const s2 = ships[1]!;
-  const d = minManhattanBetweenShips(s3, s2);
-  const edges = edgeCellCount(s3) + edgeCellCount(s2);
-  const corners = cornerTouchCount(s3) + cornerTouchCount(s2);
-  const jitter = 0.58 + Math.random() * 0.9;
-
-  switch (doctrine) {
-    case "scatter":
-      return jitter;
-    case "fleet_cluster":
-      return (1 / (0.22 + d * d)) * jitter;
-    case "perimeter":
-      return (1 + edges * 0.78 + corners * 0.52) * jitter;
-    case "open_water":
-      return (
-        Math.exp(-edges * 0.4) * (1 + Math.min(d, 5) * 0.14) * jitter
-      );
-    case "tactical": {
-      const mixed =
-        isHorizontalShip(s3) !== isHorizontalShip(s2) ? 1.45 : 1;
-      const spacing = Math.pow(Math.min(Math.max(d, 2), 6), 1.12);
-      const edgeNudge = 1 + edges * 0.62;
-      return edgeNudge * spacing * mixed * jitter;
-    }
-  }
-}
-
-function isHorizontalShip(ship: readonly number[]): boolean {
-  if (ship.length < 2) return true;
-  const sorted = [...ship].sort((x, y) => x - y);
-  return sorted[1] - sorted[0] === 1;
-}
-
-function weightedPick<T>(items: T[], weight: (item: T) => number): T {
-  const weights = items.map(weight);
-  const sum = weights.reduce((a, w) => a + w, 0);
-  if (sum <= 0 || !Number.isFinite(sum)) {
-    return randPick(items);
-  }
-  let r = Math.random() * sum;
-  for (let i = 0; i < items.length; i++) {
-    r -= weights[i]!;
-    if (r <= 0) return items[i]!;
-  }
-  return items[items.length - 1]!;
-}
-
-/** All valid non-overlapping (length-3, length-2) pairs on the 6×6 board. */
-function getAllValidShipPairs(): { ships: number[][]; shipCells: Set<number> }[] {
-  const pairs: { ships: number[][]; shipCells: Set<number> }[] = [];
-  for (const ship3 of getPlacements(3)) {
-    const occupied = new Set(ship3);
-    for (const ship2 of getPlacements(2)) {
-      if (!ship2.every((cell) => !occupied.has(cell))) continue;
-      pairs.push({
-        ships: [ship3, ship2],
-        shipCells: combineShipPlacements(ship3, ship2),
-      });
-    }
-  }
-  return pairs;
-}
-
-let cachedValidShipPairs: { ships: number[][]; shipCells: Set<number> }[] | null = null;
-
-function allValidShipPairs(): { ships: number[][]; shipCells: Set<number> }[] {
-  if (!cachedValidShipPairs) {
-    cachedValidShipPairs = getAllValidShipPairs();
-  }
-  return cachedValidShipPairs;
-}
-
-function generateShipsForDifficulty(
-  difficulty: Difficulty,
-): { ships: number[][]; shipCells: Set<number> } {
-  const pairs = allValidShipPairs();
-  const doctrine = rollPlacementDoctrine(difficulty);
-
-  if (doctrine === "scatter") {
-    return randPick(pairs);
-  }
-
-  return weightedPick(pairs, ({ ships }) =>
-    pairWeightForDoctrine(ships, doctrine),
-  );
-}
-
-function getPlacements(length: number): number[][] {
-  const placements: number[][] = [];
-
-  // Horizontal placements.
-  for (let row = 0; row < BOARD_SIZE; row++) {
-    for (let col = 0; col <= BOARD_SIZE - length; col++) {
-      const cells: number[] = [];
-      for (let i = 0; i < length; i++) {
-        cells.push(row * BOARD_SIZE + (col + i));
-      }
-      placements.push(cells);
-    }
-  }
-
-  // Vertical placements.
-  for (let row = 0; row <= BOARD_SIZE - length; row++) {
-    for (let col = 0; col < BOARD_SIZE; col++) {
-      const cells: number[] = [];
-      for (let i = 0; i < length; i++) {
-        cells.push((row + i) * BOARD_SIZE + col);
-      }
-      placements.push(cells);
-    }
-  }
-
-  return placements;
-}
-
-let nextDealId = 1;
-
-function shipsToModels(ships: number[][]): ShipModel[] {
-  return ships.map((positions) => ({
-    positions,
-    hits: 0,
-    size: positions.length,
-  }));
-}
-
-function placePlayerShips(difficulty: Difficulty): ShipModel[] {
-  return shipsToModels(generateShipsForDifficulty(difficulty).ships);
-}
-
-function placeAiShips(difficulty: Difficulty): ShipModel[] {
-  return shipsToModels(generateShipsForDifficulty(difficulty).ships);
-}
-
-/** Random valid fleets for both sides (no overlap within each fleet; independent placements). */
-function placeShips(difficulty: Difficulty): {
-  playerShips: ShipModel[];
-  aiShips: ShipModel[];
-} {
-  return {
-    playerShips: placePlayerShips(difficulty),
-    aiShips: placeAiShips(difficulty),
-  };
-}
-
-function isFleetSunk(ships: ShipModel[]): boolean {
-  return ships.every((ship) => ship.hits === ship.size);
-}
-
-function fleetOccupiedCells(ships: ShipModel[]): Set<number> {
-  const s = new Set<number>();
-  for (const sh of ships) {
-    for (const c of sh.positions) s.add(c);
-  }
-  return s;
-}
-
-function incrementShipHitForCell(ships: ShipModel[], cell: number): ShipModel[] {
-  return ships.map((sh) =>
-    sh.positions.includes(cell) ? { ...sh, hits: sh.hits + 1 } : sh,
-  );
-}
-
-/** True when this hit is the last uncovered cell of that ship. */
-function isSinkingHitForCell(ships: ShipModel[], cell: number): boolean {
-  return ships.some(
-    (sh) => sh.positions.includes(cell) && sh.hits === sh.size - 1,
-  );
-}
-
-function checkWin(
-  playerShips: ShipModel[],
-  aiShips: ShipModel[],
-): "player" | "ai" | null {
-  if (isFleetSunk(aiShips)) return "player";
-  if (isFleetSunk(playerShips)) return "ai";
-  return null;
-}
-
-function createBattleState(difficulty: Difficulty): BattleGameState {
-  const { playerShips, aiShips } = placeShips(difficulty);
-  const dealId = nextDealId++;
-  return {
-    dealId,
-    difficulty,
-    gamePhase: "setup",
-    currentTurn: mirroredCurrentTurn("setup", null),
-    playerShips,
-    aiShips,
-    playerShots: new Set<number>(),
-    aiShots: new Set<number>(),
-    status: "Randomize your ships, then start the battle.",
-    consecutiveMisses: 0,
-    lastOpponentBoardCell: null,
-    lastPlayerBoardCell: null,
-    lastOutcome: "ready",
-    winner: null,
-    playerFireEnabled: false,
-  };
-}
-
-/** True when at least one AI ship has been hit but not yet fully sunk. */
-function hasActiveHunt(game: BattleGameState): boolean {
-  return game.aiShips.some(
-    (ship) => ship.hits > 0 && ship.hits < ship.size,
-  );
-}
-
-/** Short rule-based hint from the current board (reflects the latest move). */
-function assistantTipForGame(game: BattleGameState): string {
-  if (game.winner === "player") {
-    return "You sank their fleet — play again for a new layout.";
-  }
-  if (game.winner === "ai") {
-    return "They found your ships first. Randomize and try a different formation.";
-  }
-  if (game.gamePhase === "setup") {
-    return "Use Randomize until you're happy, then start the battle.";
-  }
-  if (game.gamePhase === "aiTurn") {
-    return "Wait for the opponent's shot — watch your board.";
-  }
-  if (game.gamePhase === "playerTurn" && !game.playerFireEnabled) {
-    return "Stand by — you'll be able to fire right after the callout.";
-  }
-  if (
-    game.gamePhase === "playerTurn" &&
-    game.playerFireEnabled &&
-    game.playerShots.size === 0
-  ) {
-    return "Fire when you're ready — I'll share a quick note after each shot.";
-  }
-
-  if (game.lastOutcome === "hit") {
-    if (hasActiveHunt(game)) {
-      return "You might want to search adjacent cells";
-    }
-    return "That was a strong guess";
-  }
-
-  if (game.lastOutcome === "miss") {
-    if (hasActiveHunt(game)) {
-      return "Try focusing on areas near previous hits";
-    }
-    if (game.consecutiveMisses >= CONSECUTIVE_MISS_HINT_AFTER) {
-      return "You might want to search adjacent cells";
-    }
-    return "No contact — try another line or spacing.";
-  }
-
-  return "Keep going — you've got this.";
-}
-
-function applyPlayerFire(
-  prev: BattleGameState,
-  cellIndex: number,
-): BattleGameState {
-  const playerShots = new Set(prev.playerShots);
-  playerShots.add(cellIndex);
-  const onShip = prev.aiShips.some((s) => s.positions.includes(cellIndex));
-  if (!onShip) {
-    return {
-      ...prev,
-      playerShots,
-      consecutiveMisses: prev.consecutiveMisses + 1,
-      lastOpponentBoardCell: cellIndex,
-      lastOutcome: "miss",
-      status: "Miss!",
-      gamePhase: "aiTurn",
-      currentTurn: mirroredCurrentTurn("aiTurn", prev.winner),
-      winner: prev.winner,
-      playerFireEnabled: false,
-    };
-  }
-  const aiShips = incrementShipHitForCell(prev.aiShips, cellIndex);
-  const winner = checkWin(prev.playerShips, aiShips);
-  const nextPhase: GameLoopPhase = winner ? "gameOver" : "aiTurn";
-  const nextWinner = winner ?? prev.winner;
-  return {
-    ...prev,
-    playerShots,
-    aiShips,
-    consecutiveMisses: 0,
-    lastOpponentBoardCell: cellIndex,
-    lastOutcome: winner === "player" ? "sunk" : "hit",
-    status: winner === "player" ? "You sank their fleet!" : "Hit!",
-    gamePhase: nextPhase,
-    currentTurn: mirroredCurrentTurn(nextPhase, nextWinner),
-    winner: nextWinner,
-    playerFireEnabled: false,
-  };
-}
-
-function applyAiFire(prev: BattleGameState, cellIndex: number): BattleGameState {
-  const aiShots = new Set(prev.aiShots);
-  aiShots.add(cellIndex);
-  const onShip = prev.playerShips.some((s) => s.positions.includes(cellIndex));
-  if (!onShip) {
-    return {
-      ...prev,
-      aiShots,
-      lastPlayerBoardCell: cellIndex,
-      lastOutcome: "miss",
-      status: "They missed.",
-      gamePhase: "playerTurn",
-      currentTurn: mirroredCurrentTurn("playerTurn", prev.winner),
-      playerFireEnabled: false,
-    };
-  }
-  const playerShips = incrementShipHitForCell(prev.playerShips, cellIndex);
-  const winner = checkWin(playerShips, prev.aiShips);
-  const nextPhase: GameLoopPhase = winner ? "gameOver" : "playerTurn";
-  const nextWinner = winner ?? prev.winner;
-  return {
-    ...prev,
-    aiShots,
-    playerShips,
-    lastPlayerBoardCell: cellIndex,
-    lastOutcome: winner === "ai" ? "lost" : "hit",
-    status:
-      winner === "ai" ? "They sank your fleet!" : "They hit your ship!",
-    gamePhase: nextPhase,
-    currentTurn: mirroredCurrentTurn(nextPhase, nextWinner),
-    winner: nextWinner,
-    playerFireEnabled: false,
-  };
-}
-
-function pickRandomUnshotCell(shots: Set<number>): number {
-  const avail: number[] = [];
-  for (let i = 0; i < TOTAL_CELLS; i++) {
-    if (!shots.has(i)) avail.push(i);
-  }
-  return randPick(avail);
 }
 
 type ResetAnimPhase = "idle" | "fadeOut" | "fadeIn";
@@ -961,8 +473,17 @@ export default function Home() {
   const gameRef = useRef<BattleGameState | null>(null);
   /** Latest game for event handlers (synced during render — avoids useEffect lag vs state). */
   gameRef.current = game;
+  const aiBrainRef = useRef(createAiHuntTargetBrain());
+  const [isModalOpen, setIsModalOpen] = useState(false);
+  const [isStopConfirmOpen, setIsStopConfirmOpen] = useState(false);
   /** Locks opponent grid until shot SFX queue finishes (flushSync so repeat clicks don’t slip through). */
   const [opponentShotUiLocked, setOpponentShotUiLocked] = useState(false);
+
+  const dealIdForAiBrain = game?.dealId;
+  useEffect(() => {
+    if (dealIdForAiBrain === undefined) return;
+    aiBrainRef.current = createAiHuntTargetBrain();
+  }, [dealIdForAiBrain]);
 
   useEffect(() => {
     if (game?.winner !== "player") return;
@@ -1099,100 +620,109 @@ export default function Home() {
     explosionTimersRef.current.set(key, timer);
   };
 
-  /** Fixed-length deps so React Fast Refresh never sees a changing hook-input arity. */
-  const turnEffectDeps = [
+  /** One effect + one deps tuple avoids Fast Refresh / dev mismatches between two turn listeners. */
+  useEffect(() => {
+    if (!game || game.winner) return;
+
+    if (game.gamePhase === "aiTurn") {
+      const dealId = game.dealId;
+      const playerShotsAtStart = game.playerShots.size;
+      return runAfterTurnClip("opponent", () => {
+        const prev = gameRef.current;
+        if (
+          !prev ||
+          prev.gamePhase !== "aiTurn" ||
+          prev.winner ||
+          prev.dealId !== dealId ||
+          prev.playerShots.size !== playerShotsAtStart
+        ) {
+          return;
+        }
+        const brainSnap = {
+          mode: aiBrainRef.current.mode,
+          pendingTargets: [...aiBrainRef.current.pendingTargets],
+        };
+        const cell = pickHuntTargetAiCell(prev.aiShots, brainSnap);
+        const willHit = prev.playerShips.some((s) => s.positions.includes(cell));
+        const commitAiShot = () => {
+          const p = gameRef.current;
+          if (
+            !p ||
+            p.gamePhase !== "aiTurn" ||
+            p.winner ||
+            p.dealId !== dealId ||
+            p.playerShots.size !== playerShotsAtStart
+          ) {
+            return;
+          }
+          aiBrainRef.current.mode = brainSnap.mode;
+          aiBrainRef.current.pendingTargets = brainSnap.pendingTargets;
+          const aiShotsAfter = new Set(p.aiShots);
+          aiShotsAfter.add(cell);
+          registerAiShotResult(aiBrainRef.current, cell, willHit, aiShotsAfter);
+          setGame(applyAiFire(p, cell));
+        };
+        if (willHit) {
+          const boomKey = `p:${cell}-${prev.aiShots.size}`;
+          if (!boomShotKeysRef.current.has(boomKey)) {
+            boomShotKeysRef.current.add(boomKey);
+            triggerExplosion(explosionKey("player", cell));
+          }
+          const sinking = isSinkingHitForCell(prev.playerShips, cell);
+          const previewNext = applyAiFire(prev, cell);
+          enqueuePublicAudioEvent(HIT_AUDIO_SRC, () => {
+            if (sinking) {
+              enqueuePublicAudioEvent(SUNK_BATTLESHIP_AUDIO_SRC, () => {
+                if (previewNext.winner === "ai") {
+                  enqueuePublicAudioEvent(SUNK_FLEET_AUDIO_SRC, commitAiShot);
+                } else {
+                  commitAiShot();
+                }
+              });
+            } else {
+              commitAiShot();
+            }
+          });
+          return;
+        }
+        enqueuePublicAudioEvent(MISS_AUDIO_SRC, commitAiShot);
+      });
+    }
+
+    if (game.gamePhase === "playerTurn" && !game.playerFireEnabled) {
+      const dealId = game.dealId;
+      const aiShotsAtStart = game.aiShots.size;
+      return runAfterTurnClip("player", () => {
+        setGame((prev) => {
+          if (
+            !prev ||
+            prev.gamePhase !== "playerTurn" ||
+            prev.winner ||
+            prev.dealId !== dealId ||
+            prev.aiShots.size !== aiShotsAtStart
+          ) {
+            return prev;
+          }
+          if (prev.playerFireEnabled) return prev;
+          return { ...prev, playerFireEnabled: true };
+        });
+      });
+    }
+
+    return undefined;
+  }, [
     game,
     game?.dealId,
     game?.gamePhase,
     game?.winner,
-    game?.playerShots.size,
-    game?.aiShots.size,
+    game?.playerShots?.size,
+    game?.aiShots?.size,
     game?.playerFireEnabled,
-  ] as const;
-
-  useEffect(() => {
-    if (!game || game.gamePhase !== "aiTurn" || game.winner) return;
-    const dealId = game.dealId;
-    const playerShotsAtStart = game.playerShots.size;
-    return runAfterTurnClip("opponent", () => {
-      const prev = gameRef.current;
-      if (
-        !prev ||
-        prev.gamePhase !== "aiTurn" ||
-        prev.winner ||
-        prev.dealId !== dealId ||
-        prev.playerShots.size !== playerShotsAtStart
-      ) {
-        return;
-      }
-      const cell = pickRandomUnshotCell(prev.aiShots);
-      const willHit = prev.playerShips.some((s) => s.positions.includes(cell));
-      const commitAiShot = () => {
-        const p = gameRef.current;
-        if (
-          !p ||
-          p.gamePhase !== "aiTurn" ||
-          p.winner ||
-          p.dealId !== dealId ||
-          p.playerShots.size !== playerShotsAtStart
-        ) {
-          return;
-        }
-        setGame(applyAiFire(p, cell));
-      };
-      if (willHit) {
-        const boomKey = `p:${cell}-${prev.aiShots.size}`;
-        if (!boomShotKeysRef.current.has(boomKey)) {
-          boomShotKeysRef.current.add(boomKey);
-          triggerExplosion(explosionKey("player", cell));
-        }
-        const sinking = isSinkingHitForCell(prev.playerShips, cell);
-        const previewNext = applyAiFire(prev, cell);
-        enqueuePublicAudioEvent(HIT_AUDIO_SRC, () => {
-          if (sinking) {
-            enqueuePublicAudioEvent(SUNK_BATTLESHIP_AUDIO_SRC, () => {
-              if (previewNext.winner === "ai") {
-                enqueuePublicAudioEvent(SUNK_FLEET_AUDIO_SRC, commitAiShot);
-              } else {
-                commitAiShot();
-              }
-            });
-          } else {
-            commitAiShot();
-          }
-        });
-        return;
-      }
-      enqueuePublicAudioEvent(MISS_AUDIO_SRC, commitAiShot);
-    });
-    // eslint-disable-next-line react-hooks/exhaustive-deps -- use turnEffectDeps tuple above
-  }, turnEffectDeps);
-
-  useEffect(() => {
-    if (!game || game.gamePhase !== "playerTurn" || game.winner) return;
-    if (game.playerFireEnabled) return;
-    const dealId = game.dealId;
-    const aiShotsAtStart = game.aiShots.size;
-    return runAfterTurnClip("player", () => {
-      setGame((prev) => {
-        if (
-          !prev ||
-          prev.gamePhase !== "playerTurn" ||
-          prev.winner ||
-          prev.dealId !== dealId ||
-          prev.aiShots.size !== aiShotsAtStart
-        ) {
-          return prev;
-        }
-        if (prev.playerFireEnabled) return prev;
-        return { ...prev, playerFireEnabled: true };
-      });
-    });
-    // eslint-disable-next-line react-hooks/exhaustive-deps -- use turnEffectDeps tuple above
-  }, turnEffectDeps);
+  ]);
 
   const handleOpponentCellClick = (cellIndex: number) => {
     if (resetAnim !== "idle") return;
+    if (cellIndex < 0 || cellIndex >= TOTAL_CELLS) return;
     const g = gameRef.current;
     if (!g) return;
     if (g.gamePhase !== "playerTurn" || g.winner) return;
@@ -1320,7 +850,7 @@ export default function Home() {
       if (!prev || prev.gamePhase !== "setup") return prev;
       return {
         ...prev,
-        playerShips: placePlayerShips(prev.difficulty),
+        playerShips: placePlayerShips(),
         status: "Fleet randomized — start when ready.",
         lastOutcome: "ready",
       };
@@ -1343,38 +873,83 @@ export default function Home() {
     });
   };
 
-  const handleBackToDifficulty = () => {
-    if (!game) {
+  const performExitToDifficultySelection = () => {
+    const g = gameRef.current;
+    if (!g) {
       setPhase("setup");
       return;
     }
-    const hasProgress =
-      game.gamePhase !== "setup" ||
-      game.winner !== null ||
-      game.playerShots.size > 0 ||
-      game.aiShots.size > 0;
-    if (
-      hasProgress &&
-      typeof window !== "undefined" &&
-      !window.confirm(
-        "Return to difficulty selection? Your current game will be discarded.",
-      )
-    ) {
-      return;
-    }
+    const difficulty = g.difficulty;
     explosionTimersRef.current.forEach((t) => clearTimeout(t));
     explosionTimersRef.current.clear();
     setExplodingCells(new Set());
     boomShotKeysRef.current.clear();
+    setOpponentShotUiLocked(false);
+    cancelPublicAudioQueue();
     setResetAnim("idle");
     if (resetFadeOutTimerRef.current) {
       clearTimeout(resetFadeOutTimerRef.current);
       resetFadeOutTimerRef.current = null;
     }
-    setPendingDifficulty(game.difficulty);
+    setPendingDifficulty(difficulty);
     setGame(null);
     setPhase("setup");
   };
+
+  /** Change difficulty: browser confirm only when there is progress beyond idle fleet setup. */
+  const returnToDifficultySelectionWithBrowserConfirm = (
+    confirmMessage: string,
+  ) => {
+    const g = gameRef.current;
+    if (!g) {
+      setPhase("setup");
+      return;
+    }
+    const hasProgress =
+      g.gamePhase !== "setup" ||
+      g.winner !== null ||
+      g.playerShots.size > 0 ||
+      g.aiShots.size > 0;
+    if (
+      hasProgress &&
+      typeof window !== "undefined" &&
+      !window.confirm(confirmMessage)
+    ) {
+      return;
+    }
+    performExitToDifficultySelection();
+  };
+
+  const isTrivialSetupNoShots = (battle: BattleGameState) =>
+    battle.gamePhase === "setup" &&
+    battle.winner === null &&
+    battle.playerShots.size === 0 &&
+    battle.aiShots.size === 0;
+
+  const handleStopGame = () => {
+    const g = gameRef.current;
+    if (!g) {
+      setPhase("setup");
+      return;
+    }
+    if (isTrivialSetupNoShots(g)) {
+      performExitToDifficultySelection();
+      return;
+    }
+    setIsStopConfirmOpen(true);
+  };
+
+  const handleStopConfirmModalCancel = () => setIsStopConfirmOpen(false);
+
+  const handleStopConfirmModalConfirm = () => {
+    setIsStopConfirmOpen(false);
+    performExitToDifficultySelection();
+  };
+
+  const handleBackToDifficulty = () =>
+    returnToDifficultySelectionWithBrowserConfirm(
+      BACK_TO_DIFFICULTY_CONFIRM_MESSAGE,
+    );
 
   const playing = phase === "playing" && game !== null;
 
@@ -1464,6 +1039,13 @@ export default function Home() {
         <p className="mt-2 text-slate-400/95 text-sm sm:text-base">
           Sink the enemy fleet before they sink yours
         </p>
+        <button
+          type="button"
+          onClick={() => setIsModalOpen(true)}
+          className="mt-3 rounded-xl border border-white/12 bg-white/[0.06] px-4 py-2 text-xs font-semibold text-slate-200 transition-[background-color,border-color] duration-200 hover:border-teal-300/35 hover:bg-teal-500/10 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-teal-400/50"
+        >
+          How to Play
+        </button>
         {stats.wins > 0 && (
           <p className="mt-3 text-xs sm:text-sm text-slate-500/90 tabular-nums tracking-wide">
             Wins {stats.wins}
@@ -1499,9 +1081,8 @@ export default function Home() {
               Choose difficulty
             </h2>
             <p className="mt-2 text-center text-sm text-slate-400/95 leading-relaxed">
-              Ship layouts vary each new game—clusters, edges, open water, or
-              mixed tactics—weighted by level. Pick one, then
-              start the game.
+              Classic 10×10 grid with five ships; each deal uses a fresh random
+              layout. Pick a difficulty flavor, then start the game.
             </p>
             <div
               className="mt-6 flex flex-col gap-3"
@@ -1511,11 +1092,7 @@ export default function Home() {
               {DIFFICULTY_ORDER.map((d) => {
                 const selected = pendingDifficulty === d;
                 const blurb =
-                  d === "easy"
-                    ? "Ships placed randomly across the grid."
-                    : d === "medium"
-                      ? "Ships tend to sit closer together."
-                      : "Edges, spacing, and mixed layouts — harder to guess.";
+                  "Classic 10×10, five ships — fresh random layout every deal.";
                 return (
                   <button
                     key={d}
@@ -1637,7 +1214,7 @@ export default function Home() {
             </div>
             <div className="flex flex-col items-center gap-1 sm:items-end">
               <span className="text-center sm:text-right text-xs font-semibold uppercase tracking-wider text-slate-500 tabular-nums">
-                6×6
+                10×10
               </span>
             </div>
           </div>
@@ -1754,7 +1331,7 @@ export default function Home() {
               Opponent board
             </div>
             <div
-              className="mx-auto w-full max-w-[min(92vw,420px)] rounded-2xl border border-white/10 bg-white/[0.04] p-4 sm:p-5 shadow-[inset_0_1px_0_rgba(255,255,255,0.05)]"
+              className="mx-auto w-full max-w-[min(92vw,440px)] rounded-2xl border border-white/10 bg-white/[0.04] p-3 sm:p-4 shadow-[inset_0_1px_0_rgba(255,255,255,0.05)]"
               aria-hidden
             >
               <div
@@ -1769,7 +1346,7 @@ export default function Home() {
                   !game.playerFireEnabled
                 }
                 className={[
-                  "mx-auto grid w-full max-w-[min(100%,360px)] grid-cols-6 gap-2 sm:gap-2",
+                  "mx-auto grid w-full max-w-[min(100%,min(96vw,400px))] grid-cols-10 gap-1 sm:gap-1.5",
                   gameEnded ||
                   isResetting ||
                   opponentShotUiLocked ||
@@ -1796,12 +1373,12 @@ export default function Home() {
                   const sunkHullFragment = sunkAiHullByCell.get(i);
 
                   const cellBase =
-                    "group relative aspect-square rounded-lg border transform-gpu focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-teal-400/70 focus-visible:ring-offset-2 focus-visible:ring-offset-[#0c1526] transition-[background-color,border-color,box-shadow,transform,opacity,filter] duration-300 ease-out active:scale-[0.96]";
+                    "group relative aspect-square min-h-0 rounded-lg border focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-teal-400/70 focus-visible:ring-offset-2 focus-visible:ring-offset-[#0c1526] transition-[background-color,border-color,box-shadow,transform,opacity,filter] duration-300 ease-out active:scale-[0.96]";
 
                   const cellTone = isHit
                     ? "border-rose-300/85 bg-gradient-to-br from-rose-500/62 via-rose-600/36 to-orange-700/28 shadow-[0_0_30px_rgba(244,63,94,0.52),inset_0_1px_0_rgba(255,255,255,0.14)]"
                     : isShipFound
-                      ? shipIdx === 0
+                      ? shipIdx !== null && shipIdx % 2 === 0
                         ? "border-amber-200/75 bg-gradient-to-br from-amber-500/35 via-orange-400/18 to-orange-600/6 shadow-[0_0_34px_rgba(251,191,36,0.40),inset_0_1px_0_rgba(255,255,255,0.15)]"
                         : "border-amber-200/70 bg-gradient-to-br from-amber-500/30 via-amber-300/12 to-orange-600/5 shadow-[0_0_30px_rgba(251,191,36,0.35),inset_0_1px_0_rgba(255,255,255,0.13)]"
                       : isMiss
@@ -1824,6 +1401,11 @@ export default function Home() {
                     isShot || !oppInteractive || gameEnded
                       ? "cursor-not-allowed"
                       : "";
+
+                  /** Shot/miss buttons use scale animations; transformed hit boxes can overlap neighbors and steal clicks. */
+                  const passThroughClicksWhenShot = isShot
+                    ? "pointer-events-none"
+                    : "";
 
                   const shotDim = isShot && !didJustClick ? "opacity-[0.88]" : "";
 
@@ -1888,6 +1470,7 @@ export default function Home() {
                         cellTone,
                         cellHover,
                         cellInteractivity,
+                        passThroughClicksWhenShot,
                         shotDim,
                         cellClickAnim,
                         revealAnim,
@@ -1942,14 +1525,14 @@ export default function Home() {
               Your board
             </div>
             <div
-              className="mx-auto w-full max-w-[min(92vw,420px)] rounded-2xl border border-white/10 bg-white/[0.04] p-4 sm:p-5 shadow-[inset_0_1px_0_rgba(255,255,255,0.05)]"
+              className="mx-auto w-full max-w-[min(92vw,440px)] rounded-2xl border border-white/10 bg-white/[0.04] p-3 sm:p-4 shadow-[inset_0_1px_0_rgba(255,255,255,0.05)]"
               aria-hidden
             >
               <div
                 role="grid"
                 aria-label="Your battleship grid"
                 aria-disabled
-                className="mx-auto grid w-full max-w-[min(100%,360px)] grid-cols-6 gap-2 sm:gap-2 pointer-events-none"
+                className="mx-auto grid w-full max-w-[min(100%,min(96vw,400px))] grid-cols-10 gap-1 sm:gap-1.5 pointer-events-none"
               >
                 {cells.map((i) => {
                   const isShot = game.aiShots.has(i);
@@ -1964,14 +1547,14 @@ export default function Home() {
                   const sunkHullFragment = sunkPlayerHullByCell.get(i);
 
                   const cellBase =
-                    "group relative aspect-square rounded-lg border transform-gpu transition-[background-color,border-color,box-shadow,transform,opacity,filter] duration-300 ease-out";
+                    "group relative aspect-square min-h-0 rounded-lg border transition-[background-color,border-color,box-shadow,transform,opacity,filter] duration-300 ease-out";
 
                   const cellTone = isHit
                     ? "border-rose-300/85 bg-gradient-to-br from-rose-500/62 via-rose-600/36 to-orange-700/28 shadow-[0_0_30px_rgba(244,63,94,0.52),inset_0_1px_0_rgba(255,255,255,0.14)]"
                     : isMiss
                       ? "border-slate-400/40 bg-slate-900/35 shadow-[0_2px_10px_rgba(15,23,42,0.26)]"
                       : isOwnShip
-                        ? shipIdx === 0
+                        ? shipIdx !== null && shipIdx % 2 === 0
                           ? "border-teal-300/30 bg-teal-400/12 shadow-[0_0_22px_rgba(45,212,191,0.15),inset_0_1px_0_rgba(255,255,255,0.08)]"
                           : "border-teal-300/25 bg-teal-400/10 shadow-[0_0_18px_rgba(45,212,191,0.12),inset_0_1px_0_rgba(255,255,255,0.06)]"
                         : "border-white/12 bg-white/[0.07] shadow-[inset_0_1px_0_rgba(255,255,255,0.06)]";
@@ -2054,7 +1637,7 @@ export default function Home() {
           </div>
         </div>
 
-        <div className="mt-10 flex flex-col items-stretch gap-2.5 sm:flex-row sm:items-center sm:justify-center sm:gap-3">
+        <div className="mt-10 flex flex-col items-stretch gap-2.5 sm:flex-row sm:flex-wrap sm:items-center sm:justify-center sm:gap-3">
           <button
             type="button"
             onClick={handleReset}
@@ -2071,6 +1654,14 @@ export default function Home() {
           </button>
           <button
             type="button"
+            onClick={handleStopGame}
+            disabled={isResetting}
+            className="rounded-xl border border-slate-400/30 bg-slate-500/10 px-6 py-3.5 text-sm font-semibold text-slate-200 transition-[background-color,border-color,opacity] duration-200 ease-out hover:border-slate-300/40 hover:bg-slate-500/18 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-slate-400/45 disabled:opacity-50"
+          >
+            Stop
+          </button>
+          <button
+            type="button"
             onClick={handleBackToDifficulty}
             disabled={isResetting}
             className="rounded-xl border border-white/10 bg-transparent px-5 py-2.5 text-xs font-semibold text-slate-400 transition-[border-color,color,opacity] duration-200 ease-out hover:border-white/18 hover:text-slate-300 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-teal-400/40 disabled:opacity-50"
@@ -2082,6 +1673,98 @@ export default function Home() {
         )}
         </div>
       </section>
+
+      {isModalOpen ? (
+        <div
+          className="fixed inset-0 z-50 flex items-center justify-center bg-black/55 p-4 backdrop-blur-[2px]"
+          role="dialog"
+          aria-modal="true"
+          aria-labelledby="how-to-play-title"
+          onClick={() => setIsModalOpen(false)}
+        >
+          <div
+            className="relative w-full max-w-md rounded-2xl border border-white/12 bg-[#0c1526] p-[20px] leading-[1.5] shadow-[0_16px_60px_rgba(0,0,0,0.5),inset_0_1px_0_rgba(255,255,255,0.06)]"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <button
+              type="button"
+              onClick={() => setIsModalOpen(false)}
+              className="absolute right-3 top-3 flex h-9 w-9 items-center justify-center rounded-lg border border-white/10 text-lg leading-none text-slate-300 transition-[background-color,border-color,color] hover:border-white/20 hover:bg-white/[0.06] hover:text-white focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-teal-400/50"
+              aria-label="Close"
+            >
+              ×
+            </button>
+            <h2
+              id="how-to-play-title"
+              className="pr-10 text-lg font-bold tracking-tight text-white"
+            >
+              How to Play Battleship
+            </h2>
+            <div className="mt-4 space-y-3 text-sm text-slate-300">
+              <p>Place your ships randomly.</p>
+              <p>Take turns attacking your opponent&apos;s grid.</p>
+              <p>Hits and misses are shown on the board.</p>
+              <p>First to sink all enemy ships wins.</p>
+              <p className="font-semibold text-slate-200">Ships:</p>
+              <ul className="list-disc space-y-1 pl-5 text-slate-300">
+                <li>Carrier (5)</li>
+                <li>Battleship (4)</li>
+                <li>Cruiser (3)</li>
+                <li>Submarine (3)</li>
+                <li>Destroyer (2)</li>
+              </ul>
+            </div>
+            <button
+              type="button"
+              onClick={() => setIsModalOpen(false)}
+              className="mt-6 w-full rounded-xl border border-teal-400/35 bg-teal-500/20 py-2.5 text-sm font-semibold text-teal-50 transition-[background-color,border-color] hover:bg-teal-500/30 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-teal-400/60"
+            >
+              Close
+            </button>
+          </div>
+        </div>
+      ) : null}
+
+      {isStopConfirmOpen ? (
+        <div
+          className="fixed inset-0 z-[60] flex items-center justify-center bg-black/55 p-4 backdrop-blur-[2px]"
+          role="dialog"
+          aria-modal="true"
+          aria-labelledby="stop-confirm-title"
+          onClick={handleStopConfirmModalCancel}
+        >
+          <div
+            className="relative w-full max-w-sm rounded-2xl border border-white/12 bg-[#0c1526] p-5 shadow-[0_16px_60px_rgba(0,0,0,0.5),inset_0_1px_0_rgba(255,255,255,0.06)]"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <h2
+              id="stop-confirm-title"
+              className="text-base font-bold tracking-tight text-white"
+            >
+              Stop game
+            </h2>
+            <p className="mt-2 text-sm leading-snug text-slate-300">
+              {STOP_CONFIRM_MESSAGE}
+            </p>
+            <div className="mt-5 flex flex-col-reverse gap-2 sm:flex-row sm:justify-end">
+              <button
+                type="button"
+                onClick={handleStopConfirmModalCancel}
+                className="rounded-xl border border-white/12 bg-white/[0.04] px-4 py-2.5 text-sm font-semibold text-slate-200 transition-[background-color,border-color] hover:border-white/20 hover:bg-white/[0.08] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-slate-400/50 sm:min-w-[7rem]"
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                onClick={handleStopConfirmModalConfirm}
+                className="rounded-xl border border-slate-400/35 bg-slate-500/20 px-4 py-2.5 text-sm font-semibold text-slate-50 transition-[background-color,border-color] hover:border-slate-300/45 hover:bg-slate-500/30 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-slate-400/55 sm:min-w-[7rem]"
+              >
+                Stop
+              </button>
+            </div>
+          </div>
+        </div>
+      ) : null}
     </div>
   );
 }

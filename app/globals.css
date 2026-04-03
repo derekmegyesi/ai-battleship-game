@@ -25,35 +25,30 @@ body {
   font-family: Arial, Helvetica, sans-serif;
 }
 
-/* Hit: punchy scale + glow flash */
+/* Hit: glow flash only (no scale — scale inflates hit-testing and blocks adjacent cells). */
 @keyframes hit-impact {
   0% {
-    transform: scale(1);
     box-shadow: 0 0 0 0 rgba(251, 113, 133, 0);
   }
   40% {
-    transform: scale(1.07);
     box-shadow:
       0 0 0 2px rgba(251, 113, 133, 0.55),
       0 0 34px 6px rgba(244, 63, 94, 0.62);
   }
   100% {
-    transform: scale(1);
     box-shadow:
       0 0 28px rgba(244, 63, 94, 0.45),
       inset 0 1px 0 rgba(255, 255, 255, 0.12);
   }
 }
 
-/* Miss: gentle settle, no “pop” */
+/* Miss: opacity/brightness only (no scale — same hit-target issue as hit). */
 @keyframes miss-settle {
   0% {
-    transform: scale(0.99);
     opacity: 0.82;
     filter: brightness(0.98);
   }
   100% {
-    transform: scale(1);
     opacity: 1;
     filter: brightness(1);
   }
