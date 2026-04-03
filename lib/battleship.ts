@@ -35,6 +35,17 @@ export const DIFFICULTY_LABELS: Record<Difficulty, string> = {
   hard: "Hard",
 };
 
+/**
+ * Copy for the pre-game difficulty menu (aligned with {@link pickHuntTargetAiCell} /
+ * {@link registerAiShotResult}).
+ */
+export const DIFFICULTY_DESCRIPTIONS: Record<Difficulty, string> = {
+  easy: "Opponent shoots at random. No memory of hits and no hunt on neighboring cells — gentle practice.",
+  medium:
+    "Random search until a hit, then a simple queue of adjacent cells. No line or heading tracking.",
+  hard: "Checkerboard hunt plus full finish logic: after aligned hits, they extend along the ship's axis before searching again.",
+};
+
 export type GameLoopPhase = "setup" | "playerTurn" | "aiTurn" | "gameOver";
 
 /** Whose firing turn it is; always derived from `gamePhase` (and `winner` when `gameOver`). */
@@ -493,6 +504,68 @@ function clearAiTargetLine(brain: AiHuntTargetBrain): void {
   brain.lineDirection = null;
 }
 
+/** Hunt-only brain: no target queue or line memory (easy difficulty). */
+function resetAiBrainToHunt(brain: AiHuntTargetBrain): void {
+  brain.mode = "hunt";
+  brain.pendingTargets = [];
+  clearAiTargetLine(brain);
+}
+
+function enqueueOrthogonalNeighbors(
+  brain: AiHuntTargetBrain,
+  cell: number,
+  aiShotsAfter: Set<number>,
+): void {
+  for (const n of orthogonalNeighborCells(cell)) {
+    if (aiShotsAfter.has(n)) continue;
+    if (brain.pendingTargets.includes(n)) continue;
+    brain.pendingTargets.push(n);
+  }
+}
+
+/**
+ * Pops from the FIFO target queue until an unshot cell is found.
+ * Returns null when not in target mode, queue empty, or only stale heads remain (then finalizes hunt).
+ */
+function takeNextTargetCell(
+  aiShots: Set<number>,
+  brain: AiHuntTargetBrain,
+): number | null {
+  while (brain.mode === "target" && brain.pendingTargets.length > 0) {
+    const next = brain.pendingTargets[0]!;
+    if (aiShots.has(next)) {
+      brain.pendingTargets.shift();
+      continue;
+    }
+    brain.pendingTargets.shift();
+    return next;
+  }
+  return null;
+}
+
+function finalizeBrainHuntMode(brain: AiHuntTargetBrain): void {
+  brain.pendingTargets = [];
+  brain.mode = "hunt";
+  clearAiTargetLine(brain);
+}
+
+/** Hard hunt: random unshot checkerboard cell, even parity first. */
+function pickHardHuntCell(aiShots: Set<number>): number {
+  const evenParity: number[] = [];
+  const oddParity: number[] = [];
+  for (let i = 0; i < TOTAL_CELLS; i++) {
+    if (aiShots.has(i)) continue;
+    const { row, col } = cellRowCol(i);
+    if ((row + col) % 2 === 0) evenParity.push(i);
+    else oddParity.push(i);
+  }
+  const primary = evenParity.length > 0 ? evenParity : oddParity;
+  if (primary.length > 0) {
+    return randPick(primary);
+  }
+  return pickRandomUnshotCell(aiShots);
+}
+
 function orthoAdjacentCells(a: number, b: number): boolean {
   const A = cellRowCol(a);
   const B = cellRowCol(b);
@@ -541,89 +614,110 @@ function orthogonalNeighborCells(cell: number): number[] {
   return out;
 }
 
+export type RegisterAiShotResultOptions = {
+  sunk?: boolean;
+  /** Defaults to `"hard"` for backward compatibility. */
+  difficulty?: Difficulty;
+};
+
 /**
  * Chooses the next AI shot. Mutates `brain` (use a throwaway copy if the turn may be cancelled).
- * Target mode: FIFO from `pendingTargets` (skips already-shot indices). Hunt mode: random unshot
- * checkerboard cell, preferring (row+col) even parity then odd, then any remaining.
+ *
+ * - **easy**: uniform random over unshot cells; ignores target memory.
+ * - **medium**: FIFO target queue after hits, then uniform random hunt (no checkerboard).
+ * - **hard**: FIFO target queue, then checkerboard hunt and line-lock targeting (full strategy).
  */
 export function pickHuntTargetAiCell(
   aiShots: Set<number>,
   brain: AiHuntTargetBrain,
+  difficulty: Difficulty = "hard",
 ): number {
-  while (brain.mode === "target" && brain.pendingTargets.length > 0) {
-    const next = brain.pendingTargets[0]!;
-    if (aiShots.has(next)) {
-      brain.pendingTargets.shift();
-      continue;
-    }
-    brain.pendingTargets.shift();
-    return next;
+  if (difficulty === "easy") {
+    return pickRandomUnshotCell(aiShots);
   }
 
-  brain.pendingTargets = [];
-  brain.mode = "hunt";
-  clearAiTargetLine(brain);
+  const target = takeNextTargetCell(aiShots, brain);
+  if (target !== null) {
+    return target;
+  }
 
-  const evenParity: number[] = [];
-  const oddParity: number[] = [];
-  for (let i = 0; i < TOTAL_CELLS; i++) {
-    if (aiShots.has(i)) continue;
-    const { row, col } = cellRowCol(i);
-    if ((row + col) % 2 === 0) evenParity.push(i);
-    else oddParity.push(i);
+  finalizeBrainHuntMode(brain);
+
+  if (difficulty === "medium") {
+    return pickRandomUnshotCell(aiShots);
   }
-  const primary = evenParity.length > 0 ? evenParity : oddParity;
-  if (primary.length > 0) {
-    return randPick(primary);
+
+  return pickHardHuntCell(aiShots);
+}
+
+function registerHardHit(
+  brain: AiHuntTargetBrain,
+  cell: number,
+  aiShotsAfter: Set<number>,
+): void {
+  brain.mode = "target";
+  const prevHit = brain.lastHitCell;
+  if (prevHit !== null && orthoAdjacentCells(prevHit, cell)) {
+    const dir = directionFromTo(prevHit, cell);
+    if (dir) brain.lineDirection = dir;
+  } else {
+    brain.lineDirection = null;
   }
-  return pickRandomUnshotCell(aiShots);
+
+  if (brain.lineDirection) {
+    const dir = brain.lineDirection;
+    brain.pendingTargets = brain.pendingTargets.filter(
+      (c) => !aiShotsAfter.has(c) && cellOnOrthoLine(cell, dir, c),
+    );
+    enqueueAlongLockedLine(brain, cell, dir, aiShotsAfter);
+  } else {
+    enqueueOrthogonalNeighbors(brain, cell, aiShotsAfter);
+  }
+  brain.lastHitCell = cell;
+}
+
+function registerMediumHit(
+  brain: AiHuntTargetBrain,
+  cell: number,
+  aiShotsAfter: Set<number>,
+): void {
+  brain.mode = "target";
+  brain.lineDirection = null;
+  enqueueOrthogonalNeighbors(brain, cell, aiShotsAfter);
+  brain.lastHitCell = cell;
 }
 
 /**
- * After a committed AI shot: on hit, switch to target and enqueue neighbors (all four until
- * two adjacent hits lock an axis, then only that line — forward along the hit streak first).
- * On sink, clears the chase and returns to hunt. On miss, return to hunt if the queue is empty.
+ * After a committed AI shot. Mutates `brain`.
+ *
+ * Difficulty is read from `opts.difficulty` (default `"hard"`). **easy** clears all memory each call.
  */
 export function registerAiShotResult(
   brain: AiHuntTargetBrain,
   cell: number,
   hit: boolean,
   aiShotsAfter: Set<number>,
-  opts?: { sunk?: boolean },
+  opts?: RegisterAiShotResultOptions,
 ): void {
+  const difficulty = opts?.difficulty ?? "hard";
+
+  if (difficulty === "easy") {
+    resetAiBrainToHunt(brain);
+    return;
+  }
+
   if (hit && opts?.sunk) {
-    brain.mode = "hunt";
-    brain.pendingTargets = [];
-    clearAiTargetLine(brain);
+    resetAiBrainToHunt(brain);
     return;
   }
 
   if (hit) {
-    brain.mode = "target";
-    const prevHit = brain.lastHitCell;
-    if (prevHit !== null && orthoAdjacentCells(prevHit, cell)) {
-      const dir = directionFromTo(prevHit, cell);
-      if (dir) brain.lineDirection = dir;
+    if (difficulty === "medium") {
+      registerMediumHit(brain, cell, aiShotsAfter);
     } else {
-      brain.lineDirection = null;
+      registerHardHit(brain, cell, aiShotsAfter);
     }
-
-    if (brain.lineDirection) {
-      const dir = brain.lineDirection;
-      brain.pendingTargets = brain.pendingTargets.filter(
-        (c) => !aiShotsAfter.has(c) && cellOnOrthoLine(cell, dir, c),
-      );
-      enqueueAlongLockedLine(brain, cell, dir, aiShotsAfter);
-    } else {
-      for (const n of orthogonalNeighborCells(cell)) {
-        if (aiShotsAfter.has(n)) continue;
-        if (brain.pendingTargets.includes(n)) continue;
-        brain.pendingTargets.push(n);
-      }
-    }
-    brain.lastHitCell = cell;
   } else if (brain.pendingTargets.length === 0) {
-    brain.mode = "hunt";
-    clearAiTargetLine(brain);
+    resetAiBrainToHunt(brain);
   }
 }

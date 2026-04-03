@@ -1,6 +1,6 @@
-import { describe, expect, it, beforeEach } from "vitest";
+import { afterEach, describe, expect, it, beforeEach, vi } from "vitest";
 
-import type { BattleGameState } from "./battleship";
+import type { AiHuntTargetBrain, BattleGameState } from "./battleship";
 import {
   applyAiFire,
   applyPlayerFire,
@@ -540,6 +540,72 @@ describe("pickHuntTargetAiCell / registerAiShotResult", () => {
     for (let i = 0; i < TOTAL_CELLS; i++) shots.add(i);
     const brain = createAiHuntTargetBrain();
     expect(() => pickHuntTargetAiCell(shots, brain)).toThrow(/No unshot cells/);
+  });
+});
+
+describe("AI difficulty strategies", () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it("easy: pick ignores target queue and uses uniform random over unshot cells", () => {
+    const brain: AiHuntTargetBrain = {
+      mode: "target",
+      pendingTargets: [42],
+      lastHitCell: 0,
+      lineDirection: { dr: 0, dc: 1 },
+    };
+    const shots = new Set<number>();
+    vi.spyOn(Math, "random").mockReturnValue(0);
+    expect(pickHuntTargetAiCell(shots, brain, "easy")).toBe(0);
+    expect(brain.pendingTargets).toEqual([42]);
+  });
+
+  it("easy: register clears brain on every outcome", () => {
+    const brain: AiHuntTargetBrain = {
+      mode: "target",
+      pendingTargets: [1, 2, 3],
+      lastHitCell: 10,
+      lineDirection: { dr: 1, dc: 0 },
+    };
+    registerAiShotResult(brain, 5, true, new Set([5]), { difficulty: "easy" });
+    expect(brain.mode).toBe("hunt");
+    expect(brain.pendingTargets).toEqual([]);
+    expect(brain.lastHitCell).toBe(null);
+    expect(brain.lineDirection).toBe(null);
+  });
+
+  it("medium: hunt can target odd-parity cells on the first shot (hard uses checkerboard first)", () => {
+    const shots = new Set<number>();
+    const brainMed = createAiHuntTargetBrain();
+    vi.spyOn(Math, "random").mockReturnValue(0.011);
+    const m = pickHuntTargetAiCell(shots, brainMed, "medium");
+    expect(m).toBe(1);
+    expect((cellRowCol(m).row + cellRowCol(m).col) % 2).toBe(1);
+
+    vi.spyOn(Math, "random").mockReturnValue(0);
+    const brainHard = createAiHuntTargetBrain();
+    const h = pickHuntTargetAiCell(shots, brainHard, "hard");
+    expect((cellRowCol(h).row + cellRowCol(h).col) % 2).toBe(0);
+  });
+
+  it("medium: two collinear hits do not lock axis or drop perpendicular queue", () => {
+    const brain = createAiHuntTargetBrain();
+    registerAiShotResult(brain, 0, true, new Set([0]), { difficulty: "medium" });
+    expect(brain.lineDirection).toBe(null);
+    expect(brain.pendingTargets).toContain(1);
+    registerAiShotResult(brain, 10, true, new Set([0, 10]), { difficulty: "medium" });
+    expect(brain.lineDirection).toBe(null);
+    expect(brain.pendingTargets).toContain(1);
+  });
+
+  it("hard: two collinear hits lock axis and drop perpendicular targets", () => {
+    const brain = createAiHuntTargetBrain();
+    registerAiShotResult(brain, 0, true, new Set([0]), { difficulty: "hard" });
+    registerAiShotResult(brain, 10, true, new Set([0, 10]), { difficulty: "hard" });
+    expect(brain.lineDirection).toEqual({ dr: 1, dc: 0 });
+    expect(brain.pendingTargets).not.toContain(1);
+    expect(brain.pendingTargets[0]).toBe(20);
   });
 });
 

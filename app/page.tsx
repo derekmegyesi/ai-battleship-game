@@ -19,6 +19,7 @@ import {
   createAiHuntTargetBrain,
   createBattleState,
   type Difficulty,
+  DIFFICULTY_DESCRIPTIONS,
   DIFFICULTY_LABELS,
   fleetOccupiedCells,
   isSinkingHitForCell,
@@ -447,6 +448,20 @@ function readStoredWinFlair(
 
 const DIFFICULTY_ORDER = ["easy", "medium", "hard"] as const satisfies readonly Difficulty[];
 
+/** Left accent on the pre-game difficulty cards (visual flavor per tier). */
+const DIFFICULTY_MENU_ACCENT: Record<Difficulty, string> = {
+  easy: "border-l-emerald-400/50",
+  medium: "border-l-amber-400/50",
+  hard: "border-l-rose-400/50",
+};
+
+/** Short tag shown under each difficulty name on the setup menu. */
+const DIFFICULTY_MENU_TAG: Record<Difficulty, string> = {
+  easy: "Casual",
+  medium: "Balanced",
+  hard: "Sharp",
+};
+
 function explosionKey(board: "opponent" | "player", cell: number) {
   return `${board}:${cell}`;
 }
@@ -646,7 +661,7 @@ export default function Home() {
             ? { ...aiBrainRef.current.lineDirection }
             : null,
         };
-        const cell = pickHuntTargetAiCell(prev.aiShots, brainSnap);
+        const cell = pickHuntTargetAiCell(prev.aiShots, brainSnap, prev.difficulty);
         const willHit = prev.playerShips.some((s) => s.positions.includes(cell));
         const commitAiShot = () => {
           const p = gameRef.current;
@@ -671,6 +686,7 @@ export default function Home() {
             willHit && isSinkingHitForCell(p.playerShips, cell);
           registerAiShotResult(aiBrainRef.current, cell, willHit, aiShotsAfter, {
             sunk,
+            difficulty: p.difficulty,
           });
           setGame(applyAiFire(p, cell));
         };
@@ -1094,7 +1110,8 @@ export default function Home() {
             </h2>
             <p className="mt-2 text-center text-sm text-slate-400/95 leading-relaxed">
               Classic 10×10 grid with five ships; each deal uses a fresh random
-              layout. Pick a difficulty flavor, then start the game.
+              layout. Opponent behavior below only changes how they target your
+              fleet — pick a flavor, then start.
             </p>
             <div
               className="mt-6 flex flex-col gap-3"
@@ -1103,8 +1120,6 @@ export default function Home() {
             >
               {DIFFICULTY_ORDER.map((d) => {
                 const selected = pendingDifficulty === d;
-                const blurb =
-                  "Classic 10×10, five ships — fresh random layout every deal.";
                 return (
                   <button
                     key={d}
@@ -1113,17 +1128,29 @@ export default function Home() {
                     aria-checked={selected}
                     onClick={() => setPendingDifficulty(d)}
                     className={[
-                      "w-full rounded-xl border px-4 py-3.5 text-left transition-[background-color,border-color,box-shadow,transform] duration-200 ease-out focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-teal-400/60",
+                      "w-full rounded-xl border-t border-b border-r border-l-[3px] pl-3.5 pr-4 py-3.5 text-left transition-[background-color,border-color,box-shadow,transform] duration-200 ease-out focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-teal-400/60",
                       selected
                         ? "border-teal-400/45 bg-teal-500/20 shadow-[0_0_28px_rgba(45,212,191,0.12)]"
                         : "border-white/10 bg-white/[0.04] hover:border-white/18 hover:bg-white/[0.07]",
+                      /* After top/right/bottom color so the tier stripe stays on the left. */
+                      DIFFICULTY_MENU_ACCENT[d],
                     ].join(" ")}
                   >
-                    <div className="text-sm font-semibold text-teal-100/95">
-                      {DIFFICULTY_LABELS[d]}
+                    <div className="flex flex-wrap items-baseline justify-between gap-x-2 gap-y-0.5">
+                      <span className="text-sm font-semibold text-teal-100/95">
+                        {DIFFICULTY_LABELS[d]}
+                      </span>
+                      <span
+                        className={[
+                          "text-[10px] font-bold uppercase tracking-[0.14em]",
+                          selected ? "text-teal-200/90" : "text-slate-500",
+                        ].join(" ")}
+                      >
+                        {DIFFICULTY_MENU_TAG[d]}
+                      </span>
                     </div>
-                    <div className="mt-1 text-xs text-slate-400/90 leading-snug">
-                      {blurb}
+                    <div className="mt-1.5 text-xs text-slate-400/90 leading-snug">
+                      {DIFFICULTY_DESCRIPTIONS[d]}
                     </div>
                   </button>
                 );
@@ -1265,6 +1292,7 @@ export default function Home() {
                       <button
                         key={d}
                         type="button"
+                        title={DIFFICULTY_DESCRIPTIONS[d]}
                         onClick={() => applyDifficultyInSetup(d)}
                         className={[
                           "rounded-lg border px-2.5 py-1 text-[11px] font-semibold transition-[background-color,border-color,color] duration-150",
