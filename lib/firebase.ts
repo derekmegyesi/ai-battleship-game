@@ -5,7 +5,7 @@ import { initializeApp, type FirebaseApp } from "firebase/app";
 import { getFirestore, type Firestore } from "firebase/firestore";
 
 const firebaseConfig = {
-  apiKey: "AIzaSyDmI9Xvjt5g9xjnMK4S0H2JQXrYLz_WyTw",
+  apiKey: process.env.NEXT_PUBLIC_FIREBASE_API_KEY,
   authDomain: "ai-battleship-2026.firebaseapp.com",
   projectId: "ai-battleship-2026",
   storageBucket: "ai-battleship-2026.firebasestorage.app",
