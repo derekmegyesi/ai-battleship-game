@@ -59,25 +59,38 @@ Key capabilities include:
 - Ships track individual damage and are considered sunk when all positions are hit
 - Game ends when all ships in a fleet are destroyed
 
+Unlike a basic implementation, this project introduces structured AI behavior with multiple difficulty levels and a modular game engine.
+
 ---
 
-## AI Opponent
+## Features
 
-The AI uses a simple but effective heuristic strategy based on two modes:
+### Core Gameplay
+- Manual ship placement with validation
+- Turn-based player vs AI gameplay
+- Hit, miss, and sunk detection
+- Visual feedback for shots and ship states
 
-### Hunt Mode
-- Selects moves using a checkerboard-style pattern
-- Maximizes coverage efficiency while minimizing redundant guesses
+### Difficulty System (Fully Implemented)
 
-### Target Mode
-- Triggered after a successful hit
-- Queues adjacent cells and prioritizes them in subsequent moves
-- Focuses on completing ship destruction before returning to hunt mode
+Difficulty is not cosmetic — it directly impacts AI behavior:
 
-Additional constraints:
-- Prevents duplicate moves
-- Respects board boundaries
-- Uses a deterministic and explainable decision process
+- **Easy**
+  - Fully random targeting
+  - No memory of previous hits
+  - No targeting strategy
+
+- **Medium**
+  - Random search phase
+  - Targets adjacent cells after a hit
+  - Basic state awareness
+
+- **Hard**
+  - Hunt + target strategy
+  - Tracks ship orientation after multiple hits
+  - Prioritizes optimal targeting paths
+
+This system is implemented by threading difficulty through AI decision functions and modifying behavior without duplicating core logic.
 
 ---
 
