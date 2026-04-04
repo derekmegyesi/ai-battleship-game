@@ -467,6 +467,7 @@ function explosionKey(board: "opponent" | "player", cell: number) {
 }
 
 export default function Home() {
+
   const cells = useMemo(() => Array.from({ length: TOTAL_CELLS }, (_, i) => i), []);
   const [phase, setPhase] = useState<"setup" | "playing">("setup");
   const [pendingDifficulty, setPendingDifficulty] = useState<Difficulty>("medium");
